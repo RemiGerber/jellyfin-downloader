@@ -574,8 +574,12 @@ async function probeStream(url, cookie, referer) {
       '-show_streams',
       '-show_format',
     ];
-    if (referer) args.push('-headers', `Referer: ${referer}\r\n`);
-    if (cookie) args.push('-headers', `Cookie: ${cookie}\r\n`);
+    if (referer || cookie) {
+      let headers = '';
+      if (referer) headers += `Referer: ${referer}\r\n`;
+      if (cookie) headers += `Cookie: ${cookie}\r\n`;
+      args.push('-headers', headers);
+    }
     args.push('-timeout', '8000000');  // 8 seconds in microseconds
     args.push(url);
 
@@ -786,10 +790,29 @@ app.post('/api/detect-stream', async (req, res) => {
       } catch {}
     }));
 
-    console.log('detect-stream: returning streams:', labeled.map(s => `[${s.type}] ${s.resolution || '?'} ${s.url.substring(0, 60)}`));
+    // Deduplicate by filename — same MP4 may appear via direct request and response body with different query params
+    const byFilename = new Map();
+    for (const stream of labeled) {
+      let key;
+      try {
+        key = new URL(stream.url).pathname.split('/').pop() || stream.url;
+      } catch {
+        key = stream.url;
+      }
+      if (byFilename.has(key)) {
+        const existing = byFilename.get(key);
+        // Prefer the entry that was successfully probed (URL known to be accessible)
+        if (!existing.quality && stream.quality) Object.assign(existing, stream);
+      } else {
+        byFilename.set(key, stream);
+      }
+    }
+    const deduped = [...byFilename.values()];
+
+    console.log('detect-stream: returning streams:', deduped.map(s => `[${s.type}] ${s.resolution || '?'} ${s.url.substring(0, 60)}`));
 
     res.json({
-      streams: labeled,
+      streams: deduped,
       cookie: cookieString,
       referer: pageUrl,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
