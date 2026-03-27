@@ -8,6 +8,7 @@ const { chromium } = require('playwright');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
+const MEDIA_ROOT = process.env.MEDIA_ROOT || '/mnt/nas';
 const TEMP_DOWNLOAD_DIR = '/tmp/hls_downloads';
 const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -70,10 +71,10 @@ function createFilename(options, index) {
 function createDirectoryPath(options) {
   if (options.mediaType === 'tv') {
     const { showName, seasonNumber } = options;
-    return `/mnt/nas/shows/${showName}/Season ${String(seasonNumber).padStart(2, '0')}`;
+    return `${MEDIA_ROOT}/shows/${showName}/Season ${String(seasonNumber).padStart(2, '0')}`;
   } else {
     const { movieName, movieYear } = options;
-    return `/mnt/nas/movies/${movieName} (${movieYear})`;
+    return `${MEDIA_ROOT}/movies/${movieName} (${movieYear})`;
   }
 }
 
