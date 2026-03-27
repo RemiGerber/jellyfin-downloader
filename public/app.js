@@ -1,26 +1,5 @@
 const { useState, useRef, useEffect } = React;
 
-function Icon({ name, size = 20, className = '' }) {
-  const icons = {
-    download: '↓',
-    plus: '+',
-    x: '×',
-    play: '▶',
-    pause: '‖',
-    settings: '⚙',
-    tv: '📺',
-    film: '🎬',
-    folder: '📁',
-    check: '✓',
-    alert: '!',
-    clock: '⏱'
-  };
-  return React.createElement('span', { 
-    className: `inline-block ${className}`,
-    style: { fontSize: size }
-  }, icons[name] || '•');
-}
-
 function HLSDownloader() {
   const [urls, setUrls] = useState(['']);
   const [downloads, setDownloads] = useState([]);

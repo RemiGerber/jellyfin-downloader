@@ -3,26 +3,22 @@ const { spawn } = require('child_process');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs').promises;
-const fsSync = require('fs');
-const https = require('https');
 const http = require('http');
 const { chromium } = require('playwright');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
+const TEMP_DOWNLOAD_DIR = '/tmp/hls_downloads';
 
 app.use(express.json());
 app.use(express.static('public'));
 
-// Create HTTP server
-const server = require('http').createServer(app);
-
-// WebSocket server
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
 const activeDownloads = new Map();
+const deps = { ytDlp: false, ffmpeg: false };
 
-// Broadcast to all connected clients
 function broadcast(data) {
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
@@ -31,7 +27,6 @@ function broadcast(data) {
   });
 }
 
-// Format seconds to HH:MM:SS
 function formatTime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -39,7 +34,6 @@ function formatTime(seconds) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-// Parse ffmpeg progress output
 function parseProgress(line) {
   const pairs = {};
   line.split('\n').forEach(l => {
@@ -51,7 +45,16 @@ function parseProgress(line) {
   return pairs;
 }
 
-// Create Jellyfin-compatible filename
+function parseOutSeconds(progress) {
+  if (progress.out_time_ms) {
+    return parseInt(progress.out_time_ms) / 1000000;
+  } else if (progress.out_time) {
+    const parts = progress.out_time.split(':');
+    return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
+  }
+  return 0;
+}
+
 function createFilename(options, index) {
   if (options.mediaType === 'tv') {
     const { showName, seasonNumber, startEpisode } = options;
@@ -63,7 +66,6 @@ function createFilename(options, index) {
   }
 }
 
-// Create Jellyfin-compatible directory path
 function createDirectoryPath(options) {
   if (options.mediaType === 'tv') {
     const { showName, seasonNumber } = options;
@@ -74,7 +76,6 @@ function createDirectoryPath(options) {
   }
 }
 
-// Check if command exists
 async function commandExists(cmd) {
   try {
     const result = await new Promise((resolve) => {
@@ -87,10 +88,36 @@ async function commandExists(cmd) {
   }
 }
 
-// Strategy 1: yt-dlp (most reliable)
+// Builds the common ffmpeg input args shared by all ffmpeg-based strategies
+function buildFfmpegBaseArgs(url, settings) {
+  const args = ['-nostdin', '-hide_banner', '-loglevel', 'info'];
+
+  if (settings.userAgent) {
+    args.push('-user_agent', settings.userAgent);
+  }
+
+  if (settings.referer || settings.cookie) {
+    let headers = '';
+    if (settings.referer) headers += `Referer: ${settings.referer}\r\n`;
+    if (settings.cookie) headers += `Cookie: ${settings.cookie}\r\n`;
+    args.push('-headers', headers);
+  }
+
+  args.push(
+    '-allowed_extensions', 'ALL',
+    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-i', url,
+  );
+
+  return args;
+}
+
 async function downloadWithYtDlp(url, outputPath, options, downloadId, filename) {
   console.log('Attempting download with yt-dlp...');
-  
+
   const args = [
     '-o', outputPath,
     '-f', 'bestvideo+bestaudio/best',
@@ -100,7 +127,6 @@ async function downloadWithYtDlp(url, outputPath, options, downloadId, filename)
     '--no-part',
   ];
 
-  // Add headers
   if (options.settings.userAgent) {
     args.push('--user-agent', options.settings.userAgent);
   }
@@ -111,9 +137,7 @@ async function downloadWithYtDlp(url, outputPath, options, downloadId, filename)
     args.push('--add-header', `Cookie: ${options.settings.cookie}`);
   }
 
-  // Progress reporting
   args.push('--newline', '--progress');
-
   args.push(url);
 
   return new Promise((resolve, reject) => {
@@ -122,17 +146,16 @@ async function downloadWithYtDlp(url, outputPath, options, downloadId, filename)
 
     ytdlp.stdout.on('data', (data) => {
       const output = data.toString();
-      
-      // Parse yt-dlp progress
+
       const percentMatch = output.match(/(\d+\.?\d*)%/);
       if (percentMatch) {
         const progress = parseFloat(percentMatch[1]);
         if (progress > lastProgress) {
           lastProgress = progress;
-          
+
           const speedMatch = output.match(/(\d+\.?\d*\w+\/s)/);
           const etaMatch = output.match(/ETA\s+(\S+)/);
-          
+
           broadcast({
             type: 'progress',
             id: downloadId,
@@ -162,49 +185,11 @@ async function downloadWithYtDlp(url, outputPath, options, downloadId, filename)
   });
 }
 
-// Strategy 2: Enhanced ffmpeg with HLS-specific options
 async function downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, filename) {
   console.log('Attempting download with enhanced ffmpeg...');
-  
-  const tempDir = '/tmp/hls_downloads';
-  await fs.mkdir(tempDir, { recursive: true });
-  const progressFile = path.join(tempDir, `${downloadId}.progress`);
 
-  const args = [
-    '-nostdin',
-    '-hide_banner',
-    '-loglevel', 'info',
-  ];
-
-  // User agent
-  if (options.settings.userAgent) {
-    args.push('-user_agent', options.settings.userAgent);
-  }
-
-  // Headers
-  if (options.settings.referer || options.settings.cookie) {
-    let headers = '';
-    if (options.settings.referer) {
-      headers += `Referer: ${options.settings.referer}\r\n`;
-    }
-    if (options.settings.cookie) {
-      headers += `Cookie: ${options.settings.cookie}\r\n`;
-    }
-    args.push('-headers', headers);
-  }
-
-  // HLS-specific options
-  args.push(
-    '-allowed_extensions', 'ALL',  // Allow all segment types
-    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-  );
-
-  args.push('-i', url);
-
-  // Try to preserve original codecs first
+  const progressFile = path.join(TEMP_DOWNLOAD_DIR, `${downloadId}.progress`);
+  const args = buildFfmpegBaseArgs(url, options.settings);
   args.push(
     '-c:v', 'copy',
     '-c:a', 'copy',
@@ -215,61 +200,39 @@ async function downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, 
     '-progress', progressFile
   );
 
-  return new Promise(async (resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', args);
     let totalDuration = 0;
     let stderr = '';
 
-    // Try to get duration
-    try {
-      const ffprobe = spawn('ffprobe', [
-        '-v', 'error',
-        '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        url
-      ]);
+    // Fetch duration in parallel — updates totalDuration when it resolves
+    const ffprobe = spawn('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      url
+    ]);
+    let durationOutput = '';
+    ffprobe.stdout.on('data', d => { durationOutput += d.toString(); });
+    ffprobe.on('close', () => {
+      const duration = parseFloat(durationOutput.trim());
+      if (!isNaN(duration)) totalDuration = duration;
+    });
+    setTimeout(() => ffprobe.kill(), 10000);
 
-      let durationOutput = '';
-      ffprobe.stdout.on('data', data => {
-        durationOutput += data.toString();
-      });
-
-      await new Promise((res) => {
-        ffprobe.on('close', () => {
-          const duration = parseFloat(durationOutput.trim());
-          if (!isNaN(duration)) {
-            totalDuration = duration;
-          }
-          res();
-        });
-      });
-    } catch (err) {
-      console.log('Could not determine duration');
-    }
-
-    // Monitor progress
     const progressMonitor = setInterval(async () => {
       try {
         const progressData = await fs.readFile(progressFile, 'utf8');
         const progress = parseProgress(progressData);
-
-        let outSeconds = 0;
-        if (progress.out_time_ms) {
-          outSeconds = parseInt(progress.out_time_ms) / 1000000;
-        } else if (progress.out_time) {
-          const parts = progress.out_time.split(':');
-          outSeconds = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
-        }
+        const outSeconds = parseOutSeconds(progress);
 
         let percentage = 0;
-        let eta = 'unknown';
-        
+        let eta;
         if (totalDuration > 0 && outSeconds > 0) {
           percentage = (outSeconds / totalDuration) * 100;
           const speed = parseFloat(progress.speed || 1);
           const remaining = totalDuration - outSeconds;
-          const etaSeconds = speed > 0 ? remaining / speed : remaining;
-          eta = formatTime(etaSeconds);
+          if (speed > 0) eta = formatTime(remaining / speed);
         }
 
         broadcast({
@@ -280,10 +243,10 @@ async function downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, 
           status: 'downloading',
           progress: Math.min(percentage, 100),
           speed: progress.speed ? `${progress.speed}x` : undefined,
-          eta: eta !== 'unknown' ? eta : undefined,
+          eta,
           method: 'ffmpeg-enhanced'
         });
-      } catch (err) {
+      } catch {
         // Progress file not ready yet
       }
     }, 500);
@@ -294,57 +257,25 @@ async function downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, 
 
     ffmpeg.on('close', (code) => {
       clearInterval(progressMonitor);
-      
+      fs.unlink(progressFile).catch(() => {});
+
       if (code === 0) {
         resolve(true);
+      } else if (stderr.includes('codec') || stderr.includes('Codec')) {
+        reject(new Error('CODEC_COPY_FAILED'));
       } else {
-        // Check if it's a codec issue
-        if (stderr.includes('codec') || stderr.includes('Codec')) {
-          reject(new Error('CODEC_COPY_FAILED'));
-        } else {
-          reject(new Error(`ffmpeg failed with code ${code}`));
-        }
+        reject(new Error(`ffmpeg failed with code ${code}`));
       }
     });
   });
 }
 
-// Strategy 3: ffmpeg with re-encoding (slower but more compatible)
 async function downloadWithReencoding(url, outputPath, options, downloadId, filename) {
   console.log('Attempting download with re-encoding...');
-  
-  const tempDir = '/tmp/hls_downloads';
-  await fs.mkdir(tempDir, { recursive: true });
-  const progressFile = path.join(tempDir, `${downloadId}.progress`);
 
-  const args = [
-    '-nostdin',
-    '-hide_banner',
-    '-loglevel', 'info',
-  ];
-
-  if (options.settings.userAgent) {
-    args.push('-user_agent', options.settings.userAgent);
-  }
-
-  if (options.settings.referer || options.settings.cookie) {
-    let headers = '';
-    if (options.settings.referer) {
-      headers += `Referer: ${options.settings.referer}\r\n`;
-    }
-    if (options.settings.cookie) {
-      headers += `Cookie: ${options.settings.cookie}\r\n`;
-    }
-    args.push('-headers', headers);
-  }
-
+  const progressFile = path.join(TEMP_DOWNLOAD_DIR, `${downloadId}.progress`);
+  const args = buildFfmpegBaseArgs(url, options.settings);
   args.push(
-    '-allowed_extensions', 'ALL',
-    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', url,
     '-c:v', 'libx264',
     '-preset', 'veryfast',
     '-crf', '23',
@@ -364,20 +295,11 @@ async function downloadWithReencoding(url, outputPath, options, downloadId, file
       try {
         const progressData = await fs.readFile(progressFile, 'utf8');
         const progress = parseProgress(progressData);
-
-        let outSeconds = 0;
-        if (progress.out_time_ms) {
-          outSeconds = parseInt(progress.out_time_ms) / 1000000;
-        } else if (progress.out_time) {
-          const parts = progress.out_time.split(':');
-          outSeconds = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2]);
-        }
+        const outSeconds = parseOutSeconds(progress);
 
         if (progress.total_size && !totalDuration) {
           totalDuration = outSeconds * 1.1; // Estimate
         }
-
-        let percentage = totalDuration > 0 ? (outSeconds / totalDuration) * 100 : 0;
 
         broadcast({
           type: 'progress',
@@ -385,18 +307,19 @@ async function downloadWithReencoding(url, outputPath, options, downloadId, file
           filename,
           url,
           status: 'downloading',
-          progress: Math.min(percentage, 99),
+          progress: Math.min(totalDuration > 0 ? (outSeconds / totalDuration) * 100 : 0, 99),
           speed: progress.speed ? `${progress.speed}x` : undefined,
           method: 'ffmpeg-reencode'
         });
-      } catch (err) {
+      } catch {
         // Progress file not ready yet
       }
     }, 1000);
 
     ffmpeg.on('close', (code) => {
       clearInterval(progressMonitor);
-      
+      fs.unlink(progressFile).catch(() => {});
+
       if (code === 0) {
         resolve(true);
       } else {
@@ -406,11 +329,9 @@ async function downloadWithReencoding(url, outputPath, options, downloadId, file
   });
 }
 
-// Strategy 4: Direct mp4 download via wget (for proxy/direct mp4 URLs)
 async function downloadWithWget(url, outputPath, options, downloadId, filename) {
   console.log('Attempting direct download with wget...');
 
-  // Extract Referer/Origin from proxy URL's headers param if present
   let referer = options.settings.referer || '';
   try {
     const proxyHeaders = new URL(url).searchParams.get('headers');
@@ -453,14 +374,12 @@ async function downloadWithWget(url, outputPath, options, downloadId, filename) 
   });
 }
 
-// Main download function with fallback strategies
 async function downloadUrl(url, options, index, totalCount) {
   const filename = createFilename(options, index);
   const dirPath = createDirectoryPath(options);
   const outputPath = path.join(dirPath, filename);
   const downloadId = `${Date.now()}_${index}`;
 
-  // Create directory if it doesn't exist
   try {
     await fs.mkdir(dirPath, { recursive: true });
   } catch (err) {
@@ -468,7 +387,6 @@ async function downloadUrl(url, options, index, totalCount) {
     throw err;
   }
 
-  // Check if file already exists
   try {
     await fs.access(outputPath);
     broadcast({
@@ -488,128 +406,122 @@ async function downloadUrl(url, options, index, totalCount) {
   console.log(`\nStarting download [${index + 1}/${totalCount}]: ${filename}`);
   console.log(`URL: ${url}`);
 
-  // Check available tools
-  const hasYtDlp = await commandExists('yt-dlp');
-  const hasFfmpeg = await commandExists('ffmpeg');
-
-  if (!hasFfmpeg) {
+  if (!deps.ffmpeg) {
     throw new Error('ffmpeg is not installed');
   }
 
-  broadcast({
-    type: 'progress',
-    id: downloadId,
-    filename,
-    url,
-    status: 'starting',
-    progress: 0
-  });
+  activeDownloads.set(downloadId, { filename, url, startedAt: Date.now() });
 
-  // Try strategies in order
-  const strategies = [];
-  
-  const isDirectMp4 = /\.mp4(\?|$)/.test(url) || (url.includes('/proxy?') && url.includes('.mp4'));
-
-  if (isDirectMp4) {
-    // For direct mp4 files, try wget first (simpler, handles proxy URLs well)
-    strategies.push({ name: 'wget', fn: () => downloadWithWget(url, outputPath, options, downloadId, filename) });
-  }
-
-  if (hasYtDlp) {
-    strategies.push({
-      name: 'yt-dlp',
-      fn: () => downloadWithYtDlp(url, outputPath, options, downloadId, filename)
+  try {
+    broadcast({
+      type: 'progress',
+      id: downloadId,
+      filename,
+      url,
+      status: 'starting',
+      progress: 0
     });
-  }
 
-  if (!isDirectMp4) {
-    strategies.push(
-      {
-        name: 'ffmpeg-enhanced',
-        fn: () => downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, filename)
-      },
-      {
-        name: 'ffmpeg-reencode',
-        fn: () => downloadWithReencoding(url, outputPath, options, downloadId, filename)
-      }
-    );
-  } else {
-    // For direct mp4, ffmpeg copy is simpler than HLS-specific options
-    strategies.push({
-      name: 'ffmpeg-copy',
-      fn: () => downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, filename)
-    });
-  }
+    const strategies = [];
+    const isDirectMp4 = /\.mp4(\?|$)/.test(url) || (url.includes('/proxy?') && url.includes('.mp4'));
 
-  let lastError;
-  
-  for (const strategy of strategies) {
-    for (let attempt = 1; attempt <= options.settings.retries; attempt++) {
-      try {
-        console.log(`Trying ${strategy.name} (attempt ${attempt}/${options.settings.retries})...`);
-        
-        broadcast({
-          type: 'progress',
-          id: downloadId,
-          filename,
-          url,
-          status: 'downloading',
-          progress: 0,
-          attempt,
-          method: strategy.name
-        });
+    if (isDirectMp4) {
+      strategies.push({ name: 'wget', fn: () => downloadWithWget(url, outputPath, options, downloadId, filename) });
+    }
 
-        await strategy.fn();
-        
-        // Success!
-        console.log(`✓ Successfully downloaded with ${strategy.name}: ${filename}`);
-        broadcast({
-          type: 'progress',
-          id: downloadId,
-          filename,
-          url,
-          status: 'completed',
-          progress: 100,
-          method: strategy.name
-        });
-        
-        return { success: true, method: strategy.name };
+    if (deps.ytDlp) {
+      strategies.push({
+        name: 'yt-dlp',
+        fn: () => downloadWithYtDlp(url, outputPath, options, downloadId, filename)
+      });
+    }
 
-      } catch (err) {
-        console.error(`✗ ${strategy.name} attempt ${attempt} failed:`, err.message);
-        lastError = err;
-        
-        // If codec copy failed, skip to re-encoding immediately
-        if (err.message === 'CODEC_COPY_FAILED') {
-          console.log('Codec copy failed, skipping to re-encoding...');
-          break;
+    if (!isDirectMp4) {
+      strategies.push(
+        {
+          name: 'ffmpeg-enhanced',
+          fn: () => downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, filename)
+        },
+        {
+          name: 'ffmpeg-reencode',
+          fn: () => downloadWithReencoding(url, outputPath, options, downloadId, filename)
         }
-        
-        if (attempt < options.settings.retries) {
-          const delay = Math.pow(2, attempt) * 1000;
-          console.log(`Waiting ${delay/1000}s before retry...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
+      );
+    } else {
+      strategies.push({
+        name: 'ffmpeg-copy',
+        fn: () => downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, filename)
+      });
+    }
+
+    let lastError;
+
+    for (const strategy of strategies) {
+      for (let attempt = 1; attempt <= options.settings.retries; attempt++) {
+        try {
+          console.log(`Trying ${strategy.name} (attempt ${attempt}/${options.settings.retries})...`);
+
+          broadcast({
+            type: 'progress',
+            id: downloadId,
+            filename,
+            url,
+            status: 'downloading',
+            progress: 0,
+            attempt,
+            method: strategy.name
+          });
+
+          await strategy.fn();
+
+          console.log(`✓ Successfully downloaded with ${strategy.name}: ${filename}`);
+          broadcast({
+            type: 'progress',
+            id: downloadId,
+            filename,
+            url,
+            status: 'completed',
+            progress: 100,
+            method: strategy.name
+          });
+
+          return { success: true, method: strategy.name };
+
+        } catch (err) {
+          console.error(`✗ ${strategy.name} attempt ${attempt} failed:`, err.message);
+          lastError = err;
+
+          if (err.message === 'CODEC_COPY_FAILED') {
+            console.log('Codec copy failed, skipping to re-encoding...');
+            break;
+          }
+
+          if (attempt < options.settings.retries) {
+            const delay = Math.pow(2, attempt) * 1000;
+            console.log(`Waiting ${delay / 1000}s before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
         }
       }
     }
-  }
 
-  // All strategies failed
-  console.error('All download strategies failed');
-  broadcast({
-    type: 'progress',
-    id: downloadId,
-    filename,
-    url,
-    status: 'failed',
-    progress: 0,
-    error: lastError?.message || 'All strategies failed'
-  });
-  
-  return { success: false, error: lastError?.message };
+    console.error('All download strategies failed');
+    broadcast({
+      type: 'progress',
+      id: downloadId,
+      filename,
+      url,
+      status: 'failed',
+      progress: 0,
+      error: lastError?.message || 'All strategies failed'
+    });
+
+    return { success: false, error: lastError?.message };
+  } finally {
+    activeDownloads.delete(downloadId);
+  }
 }
 
-// API endpoint to start downloads
 app.post('/api/download', async (req, res) => {
   const { urls, mediaType, settings, showName, seasonNumber, startEpisode, endEpisode, movieName, movieYear } = req.body;
 
@@ -633,7 +545,6 @@ app.post('/api/download', async (req, res) => {
 
   res.json({ message: 'Download started', count: urls.length });
 
-  // Process downloads sequentially
   (async () => {
     const results = [];
     for (let i = 0; i < urls.length; i++) {
@@ -645,17 +556,16 @@ app.post('/api/download', async (req, res) => {
         results.push({ success: false, error: err.message });
       }
     }
-    
+
     const successful = results.filter(r => r.success).length;
-    broadcast({ 
-      type: 'complete', 
+    broadcast({
+      type: 'complete',
       message: `Completed: ${successful}/${urls.length} successful`,
       results
     });
   })();
 });
 
-// Probe a stream URL with ffprobe to get resolution, codec, duration, size
 async function probeStream(url, cookie, referer) {
   return new Promise((resolve) => {
     const args = [
@@ -666,7 +576,6 @@ async function probeStream(url, cookie, referer) {
     ];
     if (referer) args.push('-headers', `Referer: ${referer}\r\n`);
     if (cookie) args.push('-headers', `Cookie: ${cookie}\r\n`);
-    // Short timeout so probing doesn't slow things down too much
     args.push('-timeout', '8000000');  // 8 seconds in microseconds
     args.push(url);
 
@@ -698,12 +607,10 @@ async function probeStream(url, cookie, referer) {
       }
     });
     ffprobe.on('error', () => resolve(null));
-    // Kill if takes too long
     setTimeout(() => { ffprobe.kill(); resolve(null); }, 10000);
   });
 }
 
-// Detect stream URL from a webpage using a real browser
 app.post('/api/detect-stream', async (req, res) => {
   const { pageUrl } = req.body;
   if (!pageUrl) return res.status(400).json({ error: 'No pageUrl provided' });
@@ -726,13 +633,12 @@ app.post('/api/detect-stream', async (req, res) => {
       viewport: { width: 1280, height: 720 },
       locale: 'en-US',
     });
-    // Hide webdriver fingerprint
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
+    const detectedUrls = new Set();
     const detected = [];
-    const allUrls = [];
 
     function isStreamUrl(url) {
       return /\.m3u8(\?|$)/.test(url) ||
@@ -740,14 +646,11 @@ app.post('/api/detect-stream', async (req, res) => {
              /\.mp4(\?|$)/.test(url);
     }
 
-    // Extract stream URLs from arbitrary text (JSON API responses, JS files, etc.)
     function extractStreamUrls(text) {
       const found = [];
-      // Match raw and JSON-escaped URLs
       const pattern = /https?:\\?\/\\?\/[^\s"'<>]+?(?:\.m3u8|\.mpd|\.mp4)(?:[^\s"'<>]*)?/g;
       let m;
       while ((m = pattern.exec(text)) !== null) {
-        // Unescape JSON-escaped slashes
         const url = m[0].replace(/\\\//g, '/').replace(/\\u002[Ff]/g, '/');
         if (!found.includes(url)) found.push(url);
       }
@@ -755,26 +658,22 @@ app.post('/api/detect-stream', async (req, res) => {
     }
 
     function addDetected(url, label) {
-      if (!detected.find(d => d.url === url)) {
+      if (!detectedUrls.has(url)) {
+        detectedUrls.add(url);
         detected.push({ url });
         console.log(`detect-stream: found via ${label}:`, url);
         broadcast({ type: 'detect-status', message: `Found stream: ${url.substring(0, 100)}` });
       }
     }
 
-    // Intercept requests — catches direct stream loads
     context.on('request', request => {
       const url = request.url();
-      allUrls.push(url);
       if (isStreamUrl(url)) addDetected(url, 'request');
     });
 
-    // Intercept responses — catches stream URLs embedded in JSON/JS
     context.on('response', async response => {
       try {
-        const url = response.url();
         const ct = response.headers()['content-type'] || '';
-        // Only scan text-based responses (JSON, JS, plain text)
         if (ct.includes('json') || ct.includes('javascript') || ct.includes('text/plain')) {
           const body = await response.text().catch(() => '');
           const found = extractStreamUrls(body);
@@ -785,9 +684,8 @@ app.post('/api/detect-stream', async (req, res) => {
 
     const page = await context.newPage();
 
-    broadcast({ type: 'detect-status', message: `Opening page...` });
+    broadcast({ type: 'detect-status', message: 'Opening page...' });
     try {
-      // Use domcontentloaded — networkidle can hang forever on ad-heavy pages
       await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     } catch (e) {
       console.log('detect-stream: goto warning:', e.message);
@@ -796,7 +694,6 @@ app.post('/api/detect-stream', async (req, res) => {
     broadcast({ type: 'detect-status', message: 'Page loaded, looking for player...' });
     await page.waitForTimeout(2000);
 
-    // Try clicking common play button selectors on main page and all iframes
     const playSelectors = [
       '.vjs-big-play-button',
       '.jw-icon-display',
@@ -832,8 +729,6 @@ app.post('/api/detect-stream', async (req, res) => {
     }
     await page.waitForTimeout(2000);
 
-    // If still nothing found, open each iframe src directly — handles sites where
-    // the player iframe is injected via JS (e.g. JWPlayer embed pages)
     if (detected.length === 0) {
       broadcast({ type: 'detect-status', message: 'Trying embedded players...' });
       const iframeSrcs = await page.evaluate(() =>
@@ -861,40 +756,28 @@ app.post('/api/detect-stream', async (req, res) => {
       }
     }
 
-    // Grab cookies from the context
     const cookies = await context.cookies();
     const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-    // Log all urls seen for debugging
-    console.log('detect-stream: total requests seen:', allUrls.length);
-    const videoLike = allUrls.filter(u => isStreamUrl(u));
-    console.log('detect-stream: stream-like urls:', videoLike);
 
     await browser.close();
     browser = null;
 
     if (detected.length === 0) {
-      console.log('detect-stream: nothing found, sample of all URLs seen:',
-        allUrls.filter(u => !u.startsWith('data:')).slice(-30));
       return res.status(404).json({
         error: 'No stream URLs detected on this page',
         hint: 'The player may require interaction or use an unsupported protocol'
       });
     }
 
-    // Deduplicate and label by type — return ALL, let the user pick
-    const unique = [...new Map(detected.map(d => [d.url, d])).values()];
-    const labeled = unique.map(d => ({
+    const labeled = detected.map(d => ({
       url: d.url,
       type: d.url.includes('.m3u8') ? 'm3u8' : d.url.includes('.mpd') ? 'dash' : 'mp4'
     }));
-    // Sort: m3u8 first, then dash, then mp4
     labeled.sort((a, b) => {
       const order = { m3u8: 0, dash: 1, mp4: 2 };
       return order[a.type] - order[b.type];
     });
 
-    // Probe each stream with ffprobe to get quality info (run in parallel, best-effort)
     broadcast({ type: 'detect-status', message: 'Probing stream quality...' });
     await Promise.all(labeled.map(async stream => {
       try {
@@ -919,27 +802,21 @@ app.post('/api/detect-stream', async (req, res) => {
   }
 });
 
-// Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', activeDownloads: activeDownloads.size });
 });
 
-// Check dependencies
-app.get('/api/check-deps', async (req, res) => {
-  const hasYtDlp = await commandExists('yt-dlp');
-  const hasFfmpeg = await commandExists('ffmpeg');
-  
+app.get('/api/check-deps', (req, res) => {
   res.json({
-    ytdlp: hasYtDlp,
-    ffmpeg: hasFfmpeg,
-    ready: hasFfmpeg
+    ytdlp: deps.ytDlp,
+    ffmpeg: deps.ffmpeg,
+    ready: deps.ffmpeg
   });
 });
 
-// WebSocket connection handler
 wss.on('connection', (ws) => {
   console.log('Client connected');
-  
+
   ws.on('close', () => {
     console.log('Client disconnected');
   });
@@ -949,23 +826,24 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Start server
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`);
   console.log(`Access from LAN: http://<server-ip>:${PORT}`);
   console.log('\nChecking dependencies...');
-  
+
   (async () => {
-    const hasYtDlp = await commandExists('yt-dlp');
-    const hasFfmpeg = await commandExists('ffmpeg');
-    
-    console.log(`  yt-dlp: ${hasYtDlp ? '✓' : '✗ (optional but recommended)'}`);
-    console.log(`  ffmpeg: ${hasFfmpeg ? '✓' : '✗ (required)'}`);
-    
-    if (!hasFfmpeg) {
+    await fs.mkdir(TEMP_DOWNLOAD_DIR, { recursive: true }).catch(() => {});
+
+    deps.ytDlp = await commandExists('yt-dlp');
+    deps.ffmpeg = await commandExists('ffmpeg');
+
+    console.log(`  yt-dlp: ${deps.ytDlp ? '✓' : '✗ (optional but recommended)'}`);
+    console.log(`  ffmpeg: ${deps.ffmpeg ? '✓' : '✗ (required)'}`);
+
+    if (!deps.ffmpeg) {
       console.log('\n⚠️  WARNING: ffmpeg is not installed! Downloader will not work.');
     }
-    if (!hasYtDlp) {
+    if (!deps.ytDlp) {
       console.log('\n💡 TIP: Install yt-dlp for better compatibility with difficult sources');
       console.log('   pip install yt-dlp');
     }
