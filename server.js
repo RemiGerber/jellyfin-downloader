@@ -9,6 +9,7 @@ const { chromium } = require('playwright');
 const app = express();
 const PORT = process.env.PORT || 3003;
 const TEMP_DOWNLOAD_DIR = '/tmp/hls_downloads';
+const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 app.use(express.json());
 app.use(express.static('public'));
@@ -113,6 +114,38 @@ function buildFfmpegBaseArgs(url, settings) {
   );
 
   return args;
+}
+
+// Pick the best stream from a list based on quality preference
+function pickStream(streams, quality) {
+  if (!streams.length) return null;
+
+  const withRes = streams.filter(s => s.resolution);
+  const pool = withRes.length > 0 ? withRes : streams;
+
+  if (!quality || quality === 'best') {
+    return [...pool].sort((a, b) => {
+      const ha = parseInt((a.resolution || '').split('x')[1]) || 0;
+      const hb = parseInt((b.resolution || '').split('x')[1]) || 0;
+      return hb - ha;
+    })[0];
+  }
+
+  // Exact quality label match first (e.g. '1080p')
+  const exact = pool.find(s => s.quality === quality);
+  if (exact) return exact;
+
+  // Closest resolution
+  const targetHeight = parseInt(quality);
+  if (!isNaN(targetHeight) && withRes.length > 0) {
+    return [...withRes].sort((a, b) => {
+      const ha = parseInt(a.resolution.split('x')[1]) || 0;
+      const hb = parseInt(b.resolution.split('x')[1]) || 0;
+      return Math.abs(ha - targetHeight) - Math.abs(hb - targetHeight);
+    })[0];
+  }
+
+  return streams[0];
 }
 
 async function downloadWithYtDlp(url, outputPath, options, downloadId, filename) {
@@ -425,15 +458,15 @@ async function downloadUrl(url, options, index, totalCount) {
     const strategies = [];
     const isDirectMp4 = /\.mp4(\?|$)/.test(url) || (url.includes('/proxy?') && url.includes('.mp4'));
 
-    if (isDirectMp4) {
-      strategies.push({ name: 'wget', fn: () => downloadWithWget(url, outputPath, options, downloadId, filename) });
-    }
-
     if (deps.ytDlp) {
       strategies.push({
         name: 'yt-dlp',
         fn: () => downloadWithYtDlp(url, outputPath, options, downloadId, filename)
       });
+    }
+
+    if (isDirectMp4) {
+      strategies.push({ name: 'wget', fn: () => downloadWithWget(url, outputPath, options, downloadId, filename) });
     }
 
     if (!isDirectMp4) {
@@ -615,10 +648,8 @@ async function probeStream(url, cookie, referer) {
   });
 }
 
-app.post('/api/detect-stream', async (req, res) => {
-  const { pageUrl } = req.body;
-  if (!pageUrl) return res.status(400).json({ error: 'No pageUrl provided' });
-
+// Browser-based stream detection — shared by /api/detect-stream and /api/bulk-download
+async function detectPageStreams(pageUrl) {
   let browser;
   try {
     broadcast({ type: 'detect-status', message: 'Launching browser...' });
@@ -633,7 +664,7 @@ app.post('/api/detect-stream', async (req, res) => {
       ]
     });
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      userAgent: BROWSER_USER_AGENT,
       viewport: { width: 1280, height: 720 },
       locale: 'en-US',
     });
@@ -661,7 +692,15 @@ app.post('/api/detect-stream', async (req, res) => {
       return found;
     }
 
+    // Known high-quality CDN domains — these are prioritized when sorting before probing
+    const PRIORITY_DOMAINS = ['valhallastream', 'valhalla', 'vidsrc', 'embedsito', 'febbox'];
+
+    function streamPriority(url) {
+      return PRIORITY_DOMAINS.some(d => url.includes(d)) ? 0 : 1;
+    }
+
     function addDetected(url, label) {
+      if (detected.length >= 50) return; // collect broadly; we prioritize+cap before probing
       if (!detectedUrls.has(url)) {
         detectedUrls.add(url);
         detected.push({ url });
@@ -767,28 +806,37 @@ app.post('/api/detect-stream', async (req, res) => {
     browser = null;
 
     if (detected.length === 0) {
-      return res.status(404).json({
-        error: 'No stream URLs detected on this page',
-        hint: 'The player may require interaction or use an unsupported protocol'
-      });
+      return { streams: [], cookieString, userAgent: BROWSER_USER_AGENT };
     }
 
     const labeled = detected.map(d => ({
       url: d.url,
       type: d.url.includes('.m3u8') ? 'm3u8' : d.url.includes('.mpd') ? 'dash' : 'mp4'
     }));
+    // Sort: priority domains first, then by type (m3u8 > dash > mp4)
     labeled.sort((a, b) => {
+      const pa = streamPriority(a.url), pb = streamPriority(b.url);
+      if (pa !== pb) return pa - pb;
       const order = { m3u8: 0, dash: 1, mp4: 2 };
       return order[a.type] - order[b.type];
     });
 
+    // Cap before probing — prevents spawning too many simultaneous ffprobe processes
+    const MAX_STREAMS = 5;
+    const capped = labeled.slice(0, MAX_STREAMS);
+    if (labeled.length > MAX_STREAMS) {
+      console.log(`detect-stream: capping ${labeled.length} streams to ${MAX_STREAMS} before probing`);
+    }
+
     broadcast({ type: 'detect-status', message: 'Probing stream quality...' });
-    await Promise.all(labeled.map(async stream => {
+    await Promise.all(capped.map(async stream => {
       try {
         const info = await probeStream(stream.url, cookieString, pageUrl);
         if (info) Object.assign(stream, info);
       } catch {}
     }));
+    labeled.length = 0;
+    labeled.push(...capped);
 
     // Deduplicate by filename — same MP4 may appear via direct request and response body with different query params
     const byFilename = new Map();
@@ -807,22 +855,182 @@ app.post('/api/detect-stream', async (req, res) => {
         byFilename.set(key, stream);
       }
     }
-    const deduped = [...byFilename.values()];
 
-    console.log('detect-stream: returning streams:', deduped.map(s => `[${s.type}] ${s.resolution || '?'} ${s.url.substring(0, 60)}`));
+    const streams = [...byFilename.values()];
+    console.log('detect-stream: found streams:', streams.map(s => `[${s.type}] ${s.resolution || '?'} ${s.url.substring(0, 60)}`));
 
-    res.json({
-      streams: deduped,
-      cookie: cookieString,
-      referer: pageUrl,
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
+    return { streams, cookieString, userAgent: BROWSER_USER_AGENT };
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
+    throw err;
+  }
+}
+
+app.post('/api/detect-stream', async (req, res) => {
+  const { pageUrl, requiredDomain } = req.body;
+  if (!pageUrl) return res.status(400).json({ error: 'No pageUrl provided' });
+
+  const maxAttempts = requiredDomain ? 5 : 1;
+
+  try {
+    let streams, cookieString, userAgent;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt > 1) {
+        broadcast({ type: 'detect-status', message: `Required domain "${requiredDomain}" not found — retrying (attempt ${attempt}/${maxAttempts})...` });
+        await new Promise(r => setTimeout(r, 2000));
+      }
+
+      const result = await detectPageStreams(pageUrl);
+      streams = result.streams;
+      cookieString = result.cookieString;
+      userAgent = result.userAgent;
+
+      if (!requiredDomain) break;
+      const found = streams.some(s => s.url.includes(requiredDomain));
+      if (found) {
+        if (attempt > 1) broadcast({ type: 'detect-status', message: `Found "${requiredDomain}" stream on attempt ${attempt}` });
+        break;
+      }
+      if (attempt === maxAttempts) {
+        broadcast({ type: 'detect-status', message: `Could not find "${requiredDomain}" stream after ${maxAttempts} attempts` });
+      }
+    }
+
+    if (!streams.length) {
+      return res.status(404).json({
+        error: 'No stream URLs detected on this page',
+        hint: 'The player may require interaction or use an unsupported protocol'
+      });
+    }
+
+    res.json({ streams, cookie: cookieString, referer: pageUrl, userAgent });
+  } catch (err) {
     console.error('detect-stream error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/api/bulk-download', async (req, res) => {
+  const { baseUrl, seasons, quality, showName, retries = 3, requiredDomain } = req.body;
+
+  if (!baseUrl || !seasons?.length || !showName) {
+    return res.status(400).json({ error: 'Missing required fields: baseUrl, seasons, showName' });
+  }
+
+  let showId;
+  try {
+    showId = new URL(baseUrl).searchParams.get('id');
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+
+  if (!showId) {
+    return res.status(400).json({ error: 'Could not extract show ID from URL' });
+  }
+
+  const totalEpisodes = seasons.reduce((sum, s) => sum + (s.endEpisode - s.startEpisode + 1), 0);
+  res.json({ message: 'Bulk download started', totalEpisodes });
+
+  (async () => {
+    let completed = 0;
+    let failed = 0;
+    let episodeNum = 0;
+
+    for (const { season, startEpisode, endEpisode } of seasons) {
+      for (let ep = startEpisode; ep <= endEpisode; ep++) {
+        episodeNum++;
+        const epLabel = `S${String(season).padStart(2, '0')}E${String(ep).padStart(2, '0')}`;
+        const episodeUrl = `https://rivestream.org/watch?type=tv&id=${showId}&season=${season}&episode=${ep}`;
+
+        broadcast({
+          type: 'bulk-status',
+          message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — detecting stream...`,
+          episode: epLabel,
+          current: episodeNum,
+          total: totalEpisodes,
+        });
+
+        try {
+          const maxDetectAttempts = requiredDomain ? 5 : 1;
+          let streams, cookieString, userAgent;
+
+          for (let attempt = 1; attempt <= maxDetectAttempts; attempt++) {
+            if (attempt > 1) {
+              broadcast({
+                type: 'bulk-status',
+                message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — "${requiredDomain}" not found, retrying detection (${attempt}/${maxDetectAttempts})...`,
+                episode: epLabel, current: episodeNum, total: totalEpisodes,
+              });
+              await new Promise(r => setTimeout(r, 2000));
+            }
+            const result = await detectPageStreams(episodeUrl);
+            streams = result.streams;
+            cookieString = result.cookieString;
+            userAgent = result.userAgent;
+            if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break;
+          }
+
+          if (!streams.length) {
+            broadcast({ type: 'bulk-status', message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — no streams found`, episode: epLabel, error: true });
+            failed++;
+            continue;
+          }
+
+          if (requiredDomain && !streams.some(s => s.url.includes(requiredDomain))) {
+            broadcast({ type: 'bulk-status', message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — required domain "${requiredDomain}" not found after retries`, episode: epLabel, error: true });
+            failed++;
+            continue;
+          }
+
+          const stream = pickStream(streams, quality);
+          const qualityLabel = stream.quality || stream.resolution || stream.type;
+          broadcast({
+            type: 'bulk-status',
+            message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — downloading ${qualityLabel}...`,
+            episode: epLabel,
+            current: episodeNum,
+            total: totalEpisodes,
+          });
+
+          const options = {
+            mediaType: 'tv',
+            settings: {
+              cookie: cookieString,
+              userAgent,
+              referer: episodeUrl,
+              retries,
+            },
+            showName,
+            seasonNumber: season,
+            startEpisode: ep,
+          };
+
+          await downloadUrl(stream.url, options, 0, 1);
+          completed++;
+
+        } catch (err) {
+          console.error(`Bulk download error for ${epLabel}:`, err.message);
+          broadcast({
+            type: 'bulk-status',
+            message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — error: ${err.message}`,
+            episode: epLabel,
+            error: true,
+          });
+          failed++;
+        }
+      }
+    }
+
+    broadcast({
+      type: 'bulk-complete',
+      message: `Bulk download complete: ${completed}/${totalEpisodes} successful`,
+      completed,
+      failed,
+      total: totalEpisodes,
+    });
+  })();
 });
 
 app.get('/api/health', (req, res) => {
