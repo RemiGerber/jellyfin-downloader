@@ -48,6 +48,18 @@ function HLSDownloader() {
   const [isDetectingShow, setIsDetectingShow] = useState(false);
   const [detectShowStatus, setDetectShowStatus] = useState('');
 
+  // Follow mode state
+  const [followedShows, setFollowedShows] = useState([]);
+  const [followUrl, setFollowUrl] = useState('');
+  const [followName, setFollowName] = useState('');
+  const [followQuality, setFollowQuality] = useState('best');
+  const [followInterval, setFollowInterval] = useState(6);
+  const [followDownloadExisting, setFollowDownloadExisting] = useState(false);
+  const [followDetectedInfo, setFollowDetectedInfo] = useState(null);
+  const [isDetectingFollow, setIsDetectingFollow] = useState(false);
+  const [detectFollowStatus, setDetectFollowStatus] = useState('');
+  const [isAddingFollow, setIsAddingFollow] = useState(false);
+
   useEffect(() => {
     let reconnectTimeout;
     let reconnectDelay = 1000;
@@ -97,6 +109,8 @@ function HLSDownloader() {
             if (data.bulkStatus) setBulkStatus(data.bulkStatus);
             if (data.bulkProgress) setBulkProgress(data.bulkProgress);
           }
+        } else if (data.type === 'followed-shows') {
+          setFollowedShows(data.shows);
         }
       };
 
@@ -310,6 +324,74 @@ function HLSDownloader() {
     }
   };
 
+  const detectFollowShow = async () => {
+    if (!followUrl.trim()) return;
+    setIsDetectingFollow(true);
+    setDetectFollowStatus('Looking up show...');
+    setFollowDetectedInfo(null);
+    try {
+      const response = await fetch('/api/show-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseUrl: followUrl.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) { setDetectFollowStatus('Could not detect: ' + data.error); return; }
+      setFollowDetectedInfo(data);
+      if (data.showName && !followName.trim()) setFollowName(data.showName);
+      const totalEp = data.seasons.reduce((sum, s) => sum + s.endEpisode, 0);
+      setDetectFollowStatus(`${data.showName} — ${data.seasons.length} season${data.seasons.length !== 1 ? 's' : ''}, ${totalEp} episodes`);
+    } catch (err) {
+      setDetectFollowStatus('Error: ' + err.message);
+    } finally {
+      setIsDetectingFollow(false);
+    }
+  };
+
+  const addFollowShow = async () => {
+    if (!followUrl.trim()) return;
+    setIsAddingFollow(true);
+    try {
+      const response = await fetch('/api/followed-shows', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: followUrl.trim(),
+          name: followName.trim() || undefined,
+          quality: followQuality,
+          checkIntervalHours: followInterval,
+          downloadExisting: followDownloadExisting,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) { alert(data.error); return; }
+      setFollowUrl(''); setFollowName(''); setFollowDetectedInfo(null); setDetectFollowStatus('');
+    } catch (err) {
+      alert('Error: ' + err.message);
+    } finally {
+      setIsAddingFollow(false);
+    }
+  };
+
+  const removeFollowShow = async (id) => {
+    await fetch(`/api/followed-shows/${id}`, { method: 'DELETE' });
+  };
+
+  const checkFollowShowNow = async (id) => {
+    await fetch(`/api/followed-shows/${id}/check`, { method: 'POST' });
+  };
+
+  const formatRelativeTime = (isoString) => {
+    if (!isoString) return 'never';
+    const diff = Date.now() - new Date(isoString).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  };
+
   const isDark = theme === 'dark';
   const toggleTheme = () => {
     const next = isDark ? 'purple' : 'dark';
@@ -429,7 +511,11 @@ function HLSDownloader() {
           React.createElement('button', {
             onClick: () => setDownloadMode('bulk'),
             className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'bulk' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200 hover:bg-white/20')}`
-          }, '📦 Bulk Season Download')
+          }, '📦 Bulk'),
+          React.createElement('button', {
+            onClick: () => setDownloadMode('follow'),
+            className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'follow' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200 hover:bg-white/20')}`
+          }, `📺 Follow${followedShows.length > 0 ? ` (${followedShows.length})` : ''}`)
         )
       ),
 
@@ -878,6 +964,153 @@ function HLSDownloader() {
           disabled: isBulkProcessing || !wsConnected || !bulkBaseUrl.trim() || !bulkShowName.trim(),
           className: 'w-full px-6 py-3 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 text-white font-semibold rounded-lg'
         }, isBulkProcessing ? '⏸ Downloading...' : '▶ Start Bulk Download')
+      ),
+
+      // ── FOLLOW MODE ──
+      downloadMode === 'follow' && React.createElement('div', null,
+
+        // Add show card
+        React.createElement('div', { className: cardClass },
+          React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, '📺 Follow a Show'),
+          React.createElement('p', { className: `text-sm mb-4 ${mutedText}` },
+            'Add a Rivestream show URL. The app will check regularly and automatically download new episodes as they appear.'
+          ),
+
+          // URL row
+          React.createElement('div', { className: 'flex gap-2 mb-3' },
+            React.createElement('input', {
+              type: 'text',
+              value: followUrl,
+              onChange: e => { setFollowUrl(e.target.value); setFollowDetectedInfo(null); setDetectFollowStatus(''); },
+              onKeyDown: e => { if (e.key === 'Enter' && followUrl.trim() && !isDetectingFollow) detectFollowShow(); },
+              disabled: isAddingFollow,
+              placeholder: 'https://rivestream.org/watch?type=tv&id=79744',
+              className: `flex-1 disabled:opacity-50 ${inputClass}`
+            }),
+            React.createElement('button', {
+              onClick: detectFollowShow,
+              disabled: isDetectingFollow || isAddingFollow || !followUrl.trim(),
+              className: 'px-4 py-3 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white font-semibold rounded-lg whitespace-nowrap text-sm'
+            }, isDetectingFollow ? '⏳' : '🔍 Detect')
+          ),
+
+          detectFollowStatus && React.createElement('p', {
+            className: `text-sm mb-3 ${followDetectedInfo ? 'text-green-300' : mutedText}`
+          }, detectFollowStatus),
+
+          // Name override
+          React.createElement('input', {
+            type: 'text',
+            value: followName,
+            onChange: e => setFollowName(e.target.value),
+            disabled: isAddingFollow,
+            placeholder: 'Show name (auto-filled from detection)',
+            className: `mb-3 disabled:opacity-50 ${inputClass}`
+          }),
+
+          // Quality + Interval row
+          React.createElement('div', { className: 'flex gap-3 mb-3' },
+            React.createElement('div', { className: 'flex-1' },
+              React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Quality'),
+              React.createElement('select', {
+                value: followQuality,
+                onChange: e => setFollowQuality(e.target.value),
+                disabled: isAddingFollow,
+                className: `w-full disabled:opacity-50 ${inputClass}`
+              },
+                React.createElement('option', { value: 'best' }, 'Best'),
+                React.createElement('option', { value: '1080p' }, '1080p'),
+                React.createElement('option', { value: '720p' }, '720p'),
+                React.createElement('option', { value: '480p' }, '480p')
+              )
+            ),
+            React.createElement('div', { className: 'flex-1' },
+              React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Check every'),
+              React.createElement('select', {
+                value: followInterval,
+                onChange: e => setFollowInterval(parseInt(e.target.value)),
+                disabled: isAddingFollow,
+                className: `w-full disabled:opacity-50 ${inputClass}`
+              },
+                React.createElement('option', { value: 1 }, '1 hour'),
+                React.createElement('option', { value: 3 }, '3 hours'),
+                React.createElement('option', { value: 6 }, '6 hours'),
+                React.createElement('option', { value: 12 }, '12 hours'),
+                React.createElement('option', { value: 24 }, '24 hours')
+              )
+            )
+          ),
+
+          // Download existing checkbox
+          React.createElement('label', { className: `flex items-center gap-2 mb-4 cursor-pointer ${mutedText} text-sm` },
+            React.createElement('input', {
+              type: 'checkbox',
+              checked: followDownloadExisting,
+              onChange: e => setFollowDownloadExisting(e.target.checked),
+              disabled: isAddingFollow,
+              className: 'w-4 h-4 accent-purple-500'
+            }),
+            'Also download all existing episodes now'
+          ),
+
+          React.createElement('button', {
+            onClick: addFollowShow,
+            disabled: isAddingFollow || !followUrl.trim(),
+            className: 'w-full py-3 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 text-white font-semibold rounded-lg'
+          }, isAddingFollow ? '⏳ Adding...' : '+ Follow Show')
+        ),
+
+        // Followed shows list
+        followedShows.length > 0 && React.createElement('div', { className: cardClass },
+          React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, 'Followed Shows'),
+          React.createElement('div', { className: 'space-y-3' },
+            followedShows.map(show => {
+              const status = show.status;
+              const isChecking = status?.checking;
+              return React.createElement('div', {
+                key: show.id,
+                className: `rounded-xl p-4 ${isDark ? 'bg-gray-800/60 border border-gray-700/50' : 'bg-white/8 border border-white/15'}`
+              },
+                // Title row
+                React.createElement('div', { className: 'flex items-start justify-between gap-3 mb-2' },
+                  React.createElement('div', { className: 'min-w-0' },
+                    React.createElement('p', { className: 'text-white font-semibold truncate' }, show.name),
+                    React.createElement('p', { className: `text-xs ${dimText} mt-0.5` },
+                      `${show.totalSeasons} season${show.totalSeasons !== 1 ? 's' : ''}  ·  ${show.totalEpisodes} episodes  ·  ${show.quality === 'best' ? 'best quality' : show.quality}  ·  checks every ${show.checkIntervalHours}h`
+                    )
+                  ),
+                  React.createElement('div', { className: 'flex gap-1.5 shrink-0' },
+                    React.createElement('button', {
+                      onClick: () => checkFollowShowNow(show.id),
+                      disabled: isChecking,
+                      title: 'Check now',
+                      className: `px-2.5 py-1.5 text-xs rounded-lg disabled:opacity-40 transition-colors ${isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-white/10 hover:bg-white/20 text-purple-200'}`
+                    }, isChecking ? '⏳' : '🔄'),
+                    React.createElement('button', {
+                      onClick: () => { if (confirm(`Unfollow "${show.name}"?`)) removeFollowShow(show.id); },
+                      title: 'Unfollow',
+                      className: `px-2.5 py-1.5 text-xs rounded-lg transition-colors ${isDark ? 'bg-gray-700 hover:bg-red-900/50 text-gray-400 hover:text-red-400' : 'bg-white/10 hover:bg-red-500/20 text-purple-300 hover:text-red-300'}`
+                    }, '✕')
+                  )
+                ),
+
+                // Status + last checked
+                React.createElement('div', { className: 'flex items-center justify-between' },
+                  React.createElement('p', {
+                    className: `text-xs ${isChecking ? 'text-indigo-400' : (status?.message?.includes('failed') ? 'text-red-400' : (status?.message?.includes('Downloaded') || status?.message?.includes('new ep') ? 'text-green-400' : dimText))}`
+                  }, status?.message || 'Waiting for first check'),
+                  React.createElement('p', { className: `text-xs ${dimText}` },
+                    show.lastChecked ? `Checked ${formatRelativeTime(show.lastChecked)}` : 'Not yet checked'
+                  )
+                )
+              );
+            })
+          )
+        ),
+
+        followedShows.length === 0 && React.createElement('div', { className: `${cardClass} text-center py-8` },
+          React.createElement('p', { className: `${mutedText} text-sm` }, 'No shows followed yet. Add one above.')
+        )
       ),
 
       // Progress (shared)

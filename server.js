@@ -1113,6 +1113,88 @@ app.post('/api/show-info', async (req, res) => {
   }
 });
 
+// Core bulk download loop, shared by /api/bulk-download and the follow-show checker.
+async function runBulkEpisodes({ showId, showName, seasons, quality, retries = 3, requiredDomain, labelPrefix = '' }) {
+  const totalEpisodes = seasons.reduce((sum, s) => sum + (s.endEpisode - s.startEpisode + 1), 0);
+  const pfx = labelPrefix ? `[${labelPrefix}] ` : '';
+  bulkJobActive = true;
+  let completed = 0, failed = 0, episodeNum = 0;
+
+  for (const { season, startEpisode, endEpisode } of seasons) {
+    for (let ep = startEpisode; ep <= endEpisode; ep++) {
+      episodeNum++;
+      const epLabel = `S${String(season).padStart(2, '0')}E${String(ep).padStart(2, '0')}`;
+      const episodeUrl = `https://rivestream.org/watch?type=tv&id=${showId}&season=${season}&episode=${ep}`;
+
+      broadcast({
+        type: 'bulk-status',
+        message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — detecting stream...`,
+        episode: epLabel, current: episodeNum, total: totalEpisodes,
+      });
+
+      try {
+        const maxDetectAttempts = requiredDomain ? 5 : 1;
+        let streams, cookieString, userAgent;
+
+        for (let attempt = 1; attempt <= maxDetectAttempts; attempt++) {
+          if (attempt > 1) {
+            broadcast({
+              type: 'bulk-status',
+              message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — "${requiredDomain}" not found, retrying (${attempt}/${maxDetectAttempts})...`,
+              episode: epLabel, current: episodeNum, total: totalEpisodes,
+            });
+            await new Promise(r => setTimeout(r, 2000));
+          }
+          const result = await detectPageStreams(episodeUrl);
+          streams = result.streams; cookieString = result.cookieString; userAgent = result.userAgent;
+          if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break;
+        }
+
+        if (!streams.length) {
+          broadcast({ type: 'bulk-status', message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — no streams found`, episode: epLabel, error: true });
+          failed++; continue;
+        }
+        if (requiredDomain && !streams.some(s => s.url.includes(requiredDomain))) {
+          broadcast({ type: 'bulk-status', message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — required domain not found after retries`, episode: epLabel, error: true });
+          failed++; continue;
+        }
+
+        const stream = pickStream(streams, quality);
+        const qualityLabel = stream.quality || stream.resolution || stream.type;
+        broadcast({
+          type: 'bulk-status',
+          message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — downloading ${qualityLabel}...`,
+          episode: epLabel, current: episodeNum, total: totalEpisodes,
+        });
+
+        await downloadUrl(stream.url, {
+          mediaType: 'tv',
+          settings: { cookie: cookieString, userAgent, referer: episodeUrl, retries },
+          showName, seasonNumber: season, startEpisode: ep,
+        }, 0, 1);
+        completed++;
+
+      } catch (err) {
+        console.error(`Bulk download error for ${epLabel}:`, err.message);
+        broadcast({
+          type: 'bulk-status',
+          message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — error: ${err.message}`,
+          episode: epLabel, error: true,
+        });
+        failed++;
+      }
+    }
+  }
+
+  broadcast({
+    type: 'bulk-complete',
+    message: `${pfx}Download complete: ${completed}/${totalEpisodes} successful`,
+    completed, failed, total: totalEpisodes,
+  });
+
+  return { completed, failed, total: totalEpisodes };
+}
+
 app.post('/api/bulk-download', async (req, res) => {
   const { baseUrl, seasons, quality, showName, retries = 3, requiredDomain } = req.body;
 
@@ -1126,113 +1208,192 @@ app.post('/api/bulk-download', async (req, res) => {
   } catch {
     return res.status(400).json({ error: 'Invalid URL' });
   }
-
-  if (!showId) {
-    return res.status(400).json({ error: 'Could not extract show ID from URL' });
-  }
+  if (!showId) return res.status(400).json({ error: 'Could not extract show ID from URL' });
 
   const totalEpisodes = seasons.reduce((sum, s) => sum + (s.endEpisode - s.startEpisode + 1), 0);
   res.json({ message: 'Bulk download started', totalEpisodes });
 
-  bulkJobActive = true;
-  (async () => {
-    let completed = 0;
-    let failed = 0;
-    let episodeNum = 0;
+  runBulkEpisodes({ showId, showName, seasons, quality, retries, requiredDomain }).catch(err => {
+    broadcast({ type: 'bulk-complete', message: 'Bulk download failed: ' + err.message, completed: 0, failed: 0, total: totalEpisodes });
+  });
+});
 
-    for (const { season, startEpisode, endEpisode } of seasons) {
-      for (let ep = startEpisode; ep <= endEpisode; ep++) {
-        episodeNum++;
-        const epLabel = `S${String(season).padStart(2, '0')}E${String(ep).padStart(2, '0')}`;
-        const episodeUrl = `https://rivestream.org/watch?type=tv&id=${showId}&season=${season}&episode=${ep}`;
+// ── Follow Show ─────────────────────────────────────────────────────────────
+const FOLLOWED_SHOWS_FILE = path.join(__dirname, 'data', 'followed-shows.json');
+let followedShows = [];
+const followCheckStatus = new Map(); // id -> { message, checking }
+const pendingFollowDownloads = [];   // { show, seasons }[] queued while bulkJobActive
+let followQueueRunning = false;
 
-        broadcast({
-          type: 'bulk-status',
-          message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — detecting stream...`,
-          episode: epLabel,
-          current: episodeNum,
-          total: totalEpisodes,
-        });
+async function loadFollowedShows() {
+  try {
+    await fs.mkdir(path.dirname(FOLLOWED_SHOWS_FILE), { recursive: true });
+    const text = await fs.readFile(FOLLOWED_SHOWS_FILE, 'utf8');
+    followedShows = JSON.parse(text);
+  } catch {
+    followedShows = [];
+  }
+}
 
-        try {
-          const maxDetectAttempts = requiredDomain ? 5 : 1;
-          let streams, cookieString, userAgent;
+async function saveFollowedShows() {
+  await fs.mkdir(path.dirname(FOLLOWED_SHOWS_FILE), { recursive: true });
+  await fs.writeFile(FOLLOWED_SHOWS_FILE, JSON.stringify(followedShows, null, 2));
+}
 
-          for (let attempt = 1; attempt <= maxDetectAttempts; attempt++) {
-            if (attempt > 1) {
-              broadcast({
-                type: 'bulk-status',
-                message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — "${requiredDomain}" not found, retrying detection (${attempt}/${maxDetectAttempts})...`,
-                episode: epLabel, current: episodeNum, total: totalEpisodes,
-              });
-              await new Promise(r => setTimeout(r, 2000));
-            }
-            const result = await detectPageStreams(episodeUrl);
-            streams = result.streams;
-            cookieString = result.cookieString;
-            userAgent = result.userAgent;
-            if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break;
-          }
+function serializeFollowedShows() {
+  return followedShows.map(s => ({ ...s, status: followCheckStatus.get(s.id) || null }));
+}
 
-          if (!streams.length) {
-            broadcast({ type: 'bulk-status', message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — no streams found`, episode: epLabel, error: true });
-            failed++;
-            continue;
-          }
+function broadcastFollowedShows() {
+  broadcast({ type: 'followed-shows', shows: serializeFollowedShows() });
+}
 
-          if (requiredDomain && !streams.some(s => s.url.includes(requiredDomain))) {
-            broadcast({ type: 'bulk-status', message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — required domain "${requiredDomain}" not found after retries`, episode: epLabel, error: true });
-            failed++;
-            continue;
-          }
+async function processFollowQueue() {
+  if (followQueueRunning) return;
+  followQueueRunning = true;
+  while (pendingFollowDownloads.length > 0) {
+    while (bulkJobActive) await new Promise(r => setTimeout(r, 5000));
+    const { show, seasons } = pendingFollowDownloads.shift();
+    const showIdMatch = show.url.match(/[?&]id=(\d+)/);
+    if (!showIdMatch) continue;
+    try {
+      const { completed, failed, total } = await runBulkEpisodes({
+        showId: showIdMatch[1],
+        showName: show.name,
+        seasons,
+        quality: show.quality || 'best',
+        retries: 5,
+        requiredDomain: 'valhallastream',
+        labelPrefix: show.name,
+      });
+      followCheckStatus.set(show.id, {
+        message: `Downloaded ${completed}/${total} new episode${total !== 1 ? 's' : ''}${failed > 0 ? ` (${failed} failed)` : ''}`,
+        checking: false,
+      });
+    } catch (err) {
+      followCheckStatus.set(show.id, { message: `Download failed: ${err.message}`, checking: false });
+    }
+    broadcastFollowedShows();
+  }
+  followQueueRunning = false;
+}
 
-          const stream = pickStream(streams, quality);
-          const qualityLabel = stream.quality || stream.resolution || stream.type;
-          broadcast({
-            type: 'bulk-status',
-            message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — downloading ${qualityLabel}...`,
-            episode: epLabel,
-            current: episodeNum,
-            total: totalEpisodes,
-          });
+async function checkFollowedShow(show) {
+  if (followCheckStatus.get(show.id)?.checking) return;
+  followCheckStatus.set(show.id, { message: 'Checking for new episodes...', checking: true });
+  broadcastFollowedShows();
 
-          const options = {
-            mediaType: 'tv',
-            settings: {
-              cookie: cookieString,
-              userAgent,
-              referer: episodeUrl,
-              retries,
-            },
-            showName,
-            seasonNumber: season,
-            startEpisode: ep,
-          };
+  try {
+    const info = await getShowInfoFromTmdb(show.tmdbId);
+    const newSeasons = [];
 
-          await downloadUrl(stream.url, options, 0, 1);
-          completed++;
-
-        } catch (err) {
-          console.error(`Bulk download error for ${epLabel}:`, err.message);
-          broadcast({
-            type: 'bulk-status',
-            message: `[${episodeNum}/${totalEpisodes}] ${epLabel} — error: ${err.message}`,
-            episode: epLabel,
-            error: true,
-          });
-          failed++;
-        }
+    for (const s of info.seasons) {
+      const known = show.knownEpisodeCounts[String(s.season)] || 0;
+      if (s.endEpisode > known) {
+        newSeasons.push({ season: s.season, startEpisode: known + 1, endEpisode: s.endEpisode });
+        show.knownEpisodeCounts[String(s.season)] = s.endEpisode;
       }
     }
+    show.lastChecked = new Date().toISOString();
 
-    broadcast({
-      type: 'bulk-complete',
-      message: `Bulk download complete: ${completed}/${totalEpisodes} successful`,
-      completed,
-      failed,
-      total: totalEpisodes,
-    });
-  })();
+    if (newSeasons.length === 0) {
+      followCheckStatus.set(show.id, { message: 'Up to date', checking: false });
+    } else {
+      const count = newSeasons.reduce((s, n) => s + n.endEpisode - n.startEpisode + 1, 0);
+      followCheckStatus.set(show.id, {
+        message: `Found ${count} new episode${count !== 1 ? 's' : ''} — queued for download`,
+        checking: false,
+      });
+      pendingFollowDownloads.push({ show, seasons: newSeasons });
+      processFollowQueue();
+    }
+
+    await saveFollowedShows();
+    broadcastFollowedShows();
+  } catch (err) {
+    show.lastChecked = new Date().toISOString();
+    followCheckStatus.set(show.id, { message: `Check failed: ${err.message}`, checking: false });
+    await saveFollowedShows();
+    broadcastFollowedShows();
+  }
+}
+
+// Periodic check — every 30 minutes, check any shows whose interval has elapsed
+setInterval(() => {
+  const now = Date.now();
+  for (const show of followedShows) {
+    const lastChecked = show.lastChecked ? new Date(show.lastChecked).getTime() : 0;
+    const intervalMs = (show.checkIntervalHours || 6) * 60 * 60 * 1000;
+    if (now - lastChecked >= intervalMs) {
+      checkFollowedShow(show).catch(e => console.error('Follow auto-check error:', e.message));
+    }
+  }
+}, 30 * 60 * 1000);
+
+app.get('/api/followed-shows', (req, res) => {
+  res.json(serializeFollowedShows());
+});
+
+app.post('/api/followed-shows', async (req, res) => {
+  const { url, name, quality = 'best', checkIntervalHours = 6, downloadExisting = false } = req.body;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+
+  let parsedUrl;
+  try { parsedUrl = new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+
+  const tmdbId = parsedUrl.searchParams.get('id');
+  if (!tmdbId) return res.status(400).json({ error: 'Could not extract TMDB ID from URL (expected ?id=...)' });
+  if (followedShows.find(s => s.tmdbId === tmdbId)) return res.status(409).json({ error: 'This show is already being followed' });
+
+  try {
+    const info = await getShowInfoFromTmdb(tmdbId);
+    const showName = name?.trim() || info.showName || 'Unknown Show';
+    const show = {
+      id: `${tmdbId}-${Date.now()}`,
+      name: showName,
+      url,
+      tmdbId,
+      quality,
+      checkIntervalHours,
+      addedAt: new Date().toISOString(),
+      lastChecked: null,
+      // If not downloading existing, mark everything currently known so only future eps are downloaded
+      knownEpisodeCounts: downloadExisting
+        ? {}
+        : Object.fromEntries(info.seasons.map(s => [String(s.season), s.endEpisode])),
+      totalSeasons: info.seasons.length,
+      totalEpisodes: info.seasons.reduce((sum, s) => sum + s.endEpisode, 0),
+    };
+
+    followedShows.push(show);
+    await saveFollowedShows();
+    broadcastFollowedShows();
+    res.json({ show, info });
+
+    if (downloadExisting) {
+      pendingFollowDownloads.push({ show, seasons: info.seasons });
+      processFollowQueue();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/followed-shows/:id', async (req, res) => {
+  const idx = followedShows.findIndex(s => s.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Show not found' });
+  followedShows.splice(idx, 1);
+  followCheckStatus.delete(req.params.id);
+  await saveFollowedShows();
+  broadcastFollowedShows();
+  res.json({ ok: true });
+});
+
+app.post('/api/followed-shows/:id/check', (req, res) => {
+  const show = followedShows.find(s => s.id === req.params.id);
+  if (!show) return res.status(404).json({ error: 'Show not found' });
+  res.json({ ok: true });
+  checkFollowedShow(show).catch(e => console.error('Manual check error:', e.message));
 });
 
 app.get('/api/health', (req, res) => {
@@ -1270,6 +1431,11 @@ wss.on('connection', (ws) => {
     }
   }
 
+  // Send current followed-shows list so new clients are up to date
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'followed-shows', shows: serializeFollowedShows() }));
+  }
+
   ws.on('close', () => {
     console.log('Client disconnected');
   });
@@ -1286,6 +1452,8 @@ server.listen(PORT, '0.0.0.0', () => {
 
   (async () => {
     await fs.mkdir(TEMP_DOWNLOAD_DIR, { recursive: true }).catch(() => {});
+    await loadFollowedShows();
+    console.log(`  Followed shows: ${followedShows.length} loaded`);
 
     deps.ytDlp = await commandExists('yt-dlp');
     deps.ffmpeg = await commandExists('ffmpeg');

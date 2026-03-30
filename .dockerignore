@@ -1,3 +1,6 @@
 node_modules/
+data/
 .git/
 *.log
+deploy.sh
+explore-rivestream.js

@@ -14,6 +14,8 @@ services:
       #   - /home/youruser/media:/media
       #   - D:\Media:/media        (Windows)
       - /mnt/nas:/media
+      # Persists followed-shows.json across container restarts
+      - jellyfin-downloader-data:/app/data
     environment:
       # Tells the app where to write files inside the container.
       # Must match the right side of the volume mount above.
@@ -22,3 +24,6 @@ services:
       # If you change this, update the right side of the ports mapping too.
       # - PORT=3003
     restart: unless-stopped
+
+volumes:
+  jellyfin-downloader-data:
