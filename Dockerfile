@@ -1,24 +1,29 @@
-# Start from the official Playwright + Node image.
-# This gives us Node.js and a working Chromium install with all its
-# Linux dependencies already sorted — the hardest part of the setup.
-FROM mcr.microsoft.com/playwright/node:20-jammy
+# Standard Node 20 on Debian Bookworm (slim = smaller image, no GUI fluff).
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Install ffmpeg and yt-dlp.
-# apt-get handles ffmpeg; yt-dlp comes from its own installer since the
-# apt package is often outdated and yt-dlp updates frequently.
+# Install ffmpeg, wget, and the system libraries Playwright's Chromium needs.
+# We install ffmpeg and wget via apt; yt-dlp via its own binary since the
+# apt package is usually outdated.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     wget \
+    ca-certificates \
+    python3 \
  && rm -rf /var/lib/apt/lists/* \
  && wget -q -O /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
  && chmod +x /usr/local/bin/yt-dlp
 
-# Copy dependency manifest first — Docker caches each layer, so if
-# package.json hasn't changed, it skips the npm install on rebuilds.
+# Copy dependency manifest first — Docker caches this layer, so if
+# package.json hasn't changed, npm install is skipped on rebuilds.
 COPY package*.json ./
 RUN npm ci --omit=dev
+
+# Install the Chromium build that matches this exact Playwright version,
+# plus all its Linux system dependencies. Must run after npm ci so
+# Playwright's version is known.
+RUN npx playwright install --with-deps chromium
 
 # Copy the rest of the app.
 COPY server.js ./
@@ -28,7 +33,7 @@ COPY public/ ./public/
 EXPOSE 3003
 
 # Where downloaded media is written inside the container.
-# This directory gets mapped to a real folder on the host via docker-compose.
+# Mapped to a real host folder via docker-compose volumes.
 ENV MEDIA_ROOT=/media
 
 CMD ["node", "server.js"]
