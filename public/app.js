@@ -33,59 +33,95 @@ function HLSDownloader() {
   const [requiredDomain, setRequiredDomain] = useState('valhallastream');
 
   // Bulk mode state
+  const [bulkSource, setBulkSource] = useState('rivestream'); // 'rivestream' | 'custom'
   const [bulkBaseUrl, setBulkBaseUrl] = useState('');
   const [bulkShowName, setBulkShowName] = useState('');
   const [bulkQuality, setBulkQuality] = useState('best');
   const [bulkSeasons, setBulkSeasons] = useState([{ season: 1, startEpisode: 1, endEpisode: 10 }]);
   const [bulkRetries, setBulkRetries] = useState(3);
+  const [bulkRequiredDomain, setBulkRequiredDomain] = useState('');
   const [isBulkProcessing, setIsBulkProcessing] = useState(false);
   const [bulkStatus, setBulkStatus] = useState('');
   const [bulkProgress, setBulkProgress] = useState(null); // { current, total }
+  const [showInfo, setShowInfo] = useState(null); // { seasons, showName } from auto-detect
+  const [isDetectingShow, setIsDetectingShow] = useState(false);
+  const [detectShowStatus, setDetectShowStatus] = useState('');
 
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    let reconnectTimeout;
+    let reconnectDelay = 1000;
+    let shouldReconnect = true;
 
-    ws.onopen = () => {
-      setWsConnected(true);
-    };
+    function connect() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      ws.onopen = () => {
+        setWsConnected(true);
+        reconnectDelay = 1000;
+      };
 
-      if (data.type === 'detect-status') {
-        setDetectStatus(data.message);
-      } else if (data.type === 'progress') {
-        setDownloads(prev => {
-          const existing = prev.find(d => d.id === data.id);
-          if (existing) {
-            return prev.map(d => d.id === data.id ? { ...d, ...data } : d);
-          } else {
-            return [...prev, data];
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === 'detect-status') {
+          setDetectStatus(data.message);
+        } else if (data.type === 'progress') {
+          setDownloads(prev => {
+            const existing = prev.find(d => d.id === data.id);
+            if (existing) {
+              return prev.map(d => d.id === data.id ? { ...d, ...data } : d);
+            } else {
+              return [...prev, data];
+            }
+          });
+        } else if (data.type === 'complete') {
+          setIsProcessing(false);
+        } else if (data.type === 'error') {
+          setIsProcessing(false);
+        } else if (data.type === 'bulk-status') {
+          setBulkStatus(data.message);
+          if (data.current && data.total) {
+            setBulkProgress({ current: data.current, total: data.total });
           }
-        });
-      } else if (data.type === 'complete') {
-        setIsProcessing(false);
-      } else if (data.type === 'error') {
-        setIsProcessing(false);
-      } else if (data.type === 'bulk-status') {
-        setBulkStatus(data.message);
-        if (data.current && data.total) {
-          setBulkProgress({ current: data.current, total: data.total });
+        } else if (data.type === 'bulk-complete') {
+          setIsBulkProcessing(false);
+          setBulkStatus(data.message);
+          setBulkProgress(null);
+        } else if (data.type === 'session-state') {
+          if (data.isProcessing) setIsProcessing(true);
+          if (data.isBulkProcessing) {
+            setIsBulkProcessing(true);
+            if (data.bulkStatus) setBulkStatus(data.bulkStatus);
+            if (data.bulkProgress) setBulkProgress(data.bulkProgress);
+          }
         }
-      } else if (data.type === 'bulk-complete') {
-        setIsBulkProcessing(false);
-        setBulkStatus(data.message);
-        setBulkProgress(null);
-      }
-    };
+      };
 
-    ws.onclose = () => {
-      setWsConnected(false);
-    };
+      ws.onclose = () => {
+        setWsConnected(false);
+        wsRef.current = null;
+        if (shouldReconnect) {
+          reconnectTimeout = setTimeout(() => {
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+            connect();
+          }, reconnectDelay);
+        }
+      };
 
-    wsRef.current = ws;
-    return () => ws.close();
+      ws.onerror = () => {
+        ws.close();
+      };
+    }
+
+    connect();
+
+    return () => {
+      shouldReconnect = false;
+      clearTimeout(reconnectTimeout);
+      if (wsRef.current) wsRef.current.close();
+    };
   }, []);
 
   // Manual mode handlers
@@ -192,7 +228,7 @@ function HLSDownloader() {
   // Bulk mode handlers
   const addBulkSeason = () => {
     const last = bulkSeasons[bulkSeasons.length - 1];
-    setBulkSeasons([...bulkSeasons, { season: last.season + 1, startEpisode: 1, endEpisode: 10 }]);
+    setBulkSeasons([...bulkSeasons, { season: (parseInt(last.season) || 1) + 1, startEpisode: 1, endEpisode: 10 }]);
   };
 
   const removeBulkSeason = (index) => {
@@ -200,7 +236,9 @@ function HLSDownloader() {
   };
 
   const updateBulkSeason = (index, field, value) => {
-    const updated = bulkSeasons.map((s, i) => i === index ? { ...s, [field]: parseInt(value) || 1 } : s);
+    // Allow empty string so users can fully clear the field before typing a new number
+    const stored = value === '' ? '' : (parseInt(value) || 1);
+    const updated = bulkSeasons.map((s, i) => i === index ? { ...s, [field]: stored } : s);
     setBulkSeasons(updated);
   };
 
@@ -221,11 +259,15 @@ function HLSDownloader() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           baseUrl: bulkBaseUrl.trim(),
-          seasons: bulkSeasons,
+          seasons: bulkSeasons.map(s => ({
+            season: parseInt(s.season) || 1,
+            startEpisode: parseInt(s.startEpisode) || 1,
+            endEpisode: parseInt(s.endEpisode) || 1,
+          })),
           quality: bulkQuality,
           showName: bulkShowName.trim(),
-          retries: bulkRetries,
-          requiredDomain: requiredDomain.trim() || undefined,
+          retries: bulkSource === 'rivestream' ? 5 : bulkRetries,
+          requiredDomain: bulkSource === 'rivestream' ? 'valhallastream' : (bulkRequiredDomain.trim() || undefined),
         })
       });
       const data = await response.json();
@@ -236,6 +278,34 @@ function HLSDownloader() {
     } catch (err) {
       alert('Failed to start bulk download: ' + err.message);
       setIsBulkProcessing(false);
+    }
+  };
+
+  const detectShow = async () => {
+    if (!bulkBaseUrl.trim()) return;
+    setIsDetectingShow(true);
+    setDetectShowStatus('Opening page and scanning for season data...');
+    setShowInfo(null);
+    try {
+      const response = await fetch('/api/show-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseUrl: bulkBaseUrl.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setDetectShowStatus('Could not detect: ' + data.error);
+        return;
+      }
+      setShowInfo(data);
+      if (data.showName && !bulkShowName.trim()) setBulkShowName(data.showName);
+      setBulkSeasons(data.seasons);
+      const totalEp = data.seasons.reduce((sum, s) => sum + s.endEpisode, 0);
+      setDetectShowStatus(`Detected ${data.seasons.length} season${data.seasons.length !== 1 ? 's' : ''}, ${totalEp} episodes`);
+    } catch (err) {
+      setDetectShowStatus('Error: ' + err.message);
+    } finally {
+      setIsDetectingShow(false);
     }
   };
 
@@ -479,20 +549,121 @@ function HLSDownloader() {
 
       // ── BULK MODE ──
       downloadMode === 'bulk' && React.createElement('div', { className: cardClass },
-        React.createElement('h2', { className: 'text-xl font-bold text-white mb-6' }, '📦 Bulk Season Download'),
+        React.createElement('h2', { className: 'text-xl font-bold text-white mb-5' }, '📦 Bulk Season Download'),
 
-        React.createElement('div', { className: 'space-y-4 mb-6' },
-          // Show URL
-          React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Rivestream Show URL'),
-            React.createElement('input', {
-              type: 'text',
-              value: bulkBaseUrl,
-              onChange: e => setBulkBaseUrl(e.target.value),
+        // ── Source toggle ──
+        React.createElement('div', { className: 'mb-5' },
+          React.createElement('div', { className: 'flex gap-2 mb-3' },
+            React.createElement('button', {
+              onClick: () => setBulkSource('rivestream'),
               disabled: isBulkProcessing,
-              placeholder: 'https://rivestream.org/watch?type=tv&id=79744',
-              className: inputClass + ' disabled:opacity-50'
-            })
+              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'rivestream' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-300 hover:bg-white/20'}`
+            }, '🎬 Rivestream'),
+            React.createElement('button', {
+              onClick: () => setBulkSource('custom'),
+              disabled: isBulkProcessing,
+              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'custom' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-300 hover:bg-white/20'}`
+            }, '⚙️ Custom Source')
+          ),
+
+          // Rivestream preset info badge
+          bulkSource === 'rivestream' && React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+            React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
+              '✓ Domain: valhallastream'
+            ),
+            React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
+              '✓ 5 retries per episode'
+            ),
+            React.createElement('span', { className: 'text-purple-400 text-xs' }, 'Optimised for Rivestream streams')
+          ),
+
+          // Custom source fields
+          bulkSource === 'custom' && React.createElement('div', { className: 'space-y-3 bg-white/5 rounded-xl p-4 border border-white/10' },
+            React.createElement('p', { className: 'text-purple-300 text-xs' },
+              'Configure how streams are detected. These settings override the Rivestream defaults.'
+            ),
+            React.createElement('div', null,
+              React.createElement('label', { className: 'block text-purple-200 mb-1 text-xs font-medium' }, 'Required stream domain'),
+              React.createElement('input', {
+                type: 'text',
+                value: bulkRequiredDomain,
+                onChange: e => setBulkRequiredDomain(e.target.value),
+                disabled: isBulkProcessing,
+                placeholder: 'e.g. valhallastream — leave empty to accept any CDN',
+                className: 'w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white text-sm placeholder-purple-400 disabled:opacity-50'
+              }),
+              React.createElement('p', { className: 'text-purple-500 text-xs mt-1' },
+                'When set, detection retries until a stream URL from this hostname is found (up to 5 attempts per episode).'
+              )
+            ),
+            React.createElement('div', null,
+              React.createElement('label', { className: 'block text-purple-200 mb-1 text-xs font-medium' }, 'Retries per episode'),
+              React.createElement('input', {
+                type: 'number',
+                value: bulkRetries,
+                onChange: e => setBulkRetries(parseInt(e.target.value) || 3),
+                disabled: isBulkProcessing,
+                className: 'w-32 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white text-sm disabled:opacity-50',
+                min: 1, max: 10
+              }),
+              React.createElement('p', { className: 'text-purple-500 text-xs mt-1' },
+                'How many times to retry stream detection and download per episode before giving up.'
+              )
+            )
+          )
+        ),
+
+        // ── Show URL + Detect button ──
+        React.createElement('div', { className: 'space-y-4 mb-5' },
+          React.createElement('div', null,
+            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' },
+              bulkSource === 'rivestream' ? 'Rivestream Show URL' : 'Show Page URL'
+            ),
+            React.createElement('div', { className: 'flex gap-2' },
+              React.createElement('input', {
+                type: 'text',
+                value: bulkBaseUrl,
+                onChange: e => setBulkBaseUrl(e.target.value),
+                onKeyDown: e => { if (e.key === 'Enter' && bulkBaseUrl.trim() && !isDetectingShow) detectShow(); },
+                disabled: isBulkProcessing || isDetectingShow,
+                placeholder: bulkSource === 'rivestream'
+                  ? 'https://rivestream.org/watch?type=tv&id=79744'
+                  : 'https://example.com/show/game-of-thrones',
+                className: 'flex-1 bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300 disabled:opacity-50'
+              }),
+              React.createElement('button', {
+                onClick: detectShow,
+                disabled: isBulkProcessing || isDetectingShow || !bulkBaseUrl.trim(),
+                className: 'px-4 py-3 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white font-semibold rounded-lg whitespace-nowrap text-sm'
+              }, isDetectingShow ? '⏳ Detecting...' : '🔍 Detect Show')
+            ),
+            detectShowStatus && React.createElement('p', {
+              className: `text-sm mt-2 ${showInfo ? 'text-green-300' : 'text-purple-300'}`
+            }, detectShowStatus)
+          ),
+
+          // Auto-detect result: quick-select buttons
+          showInfo && React.createElement('div', { className: 'bg-indigo-500/10 border border-indigo-500/20 rounded-xl p-4' },
+            React.createElement('p', { className: 'text-indigo-200 text-sm font-medium mb-3' },
+              `✓ Detected ${showInfo.seasons.length} season${showInfo.seasons.length !== 1 ? 's' : ''}`
+            ),
+            React.createElement('div', { className: 'flex flex-wrap gap-2' },
+              // "Entire show" button
+              React.createElement('button', {
+                onClick: () => setBulkSeasons(showInfo.seasons),
+                disabled: isBulkProcessing,
+                className: 'px-3 py-1.5 bg-indigo-500/40 hover:bg-indigo-500/60 text-indigo-100 text-xs font-semibold rounded-lg disabled:opacity-50'
+              }, `▶ Entire show (${showInfo.seasons.reduce((sum, s) => sum + s.endEpisode, 0)} ep)`),
+              // Per-season buttons
+              showInfo.seasons.map(s =>
+                React.createElement('button', {
+                  key: s.season,
+                  onClick: () => setBulkSeasons([s]),
+                  disabled: isBulkProcessing,
+                  className: 'px-3 py-1.5 bg-white/10 hover:bg-white/20 text-purple-200 text-xs rounded-lg disabled:opacity-50'
+                }, `S${String(s.season).padStart(2, '0')} (${s.endEpisode} ep)`)
+              )
+            )
           ),
 
           // Show Name
@@ -508,54 +679,25 @@ function HLSDownloader() {
             })
           ),
 
-          // Required domain
+          // Quality
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Required stream domain'),
-            React.createElement('input', {
-              type: 'text',
-              value: requiredDomain,
-              onChange: e => setRequiredDomain(e.target.value),
+            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Quality'),
+            React.createElement('select', {
+              value: bulkQuality,
+              onChange: e => setBulkQuality(e.target.value),
               disabled: isBulkProcessing,
-              placeholder: 'e.g. valhallastream (leave empty to accept any)',
-              className: inputClass + ' disabled:opacity-50'
-            }),
-            React.createElement('p', { className: 'text-purple-400 text-xs mt-1' },
-              'If set, detection retries up to 5× per episode until a stream from this domain is found.'
-            )
-          ),
-
-          // Quality + Retries row
-          React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
-            React.createElement('div', null,
-              React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Quality'),
-              React.createElement('select', {
-                value: bulkQuality,
-                onChange: e => setBulkQuality(e.target.value),
-                disabled: isBulkProcessing,
-                className: 'w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white disabled:opacity-50'
-              },
-                React.createElement('option', { value: 'best' }, 'Best available'),
-                React.createElement('option', { value: '1080p' }, '1080p'),
-                React.createElement('option', { value: '720p' }, '720p'),
-                React.createElement('option', { value: '480p' }, '480p'),
-                React.createElement('option', { value: '360p' }, '360p')
-              )
-            ),
-            React.createElement('div', null,
-              React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Retries per episode'),
-              React.createElement('input', {
-                type: 'number',
-                value: bulkRetries,
-                onChange: e => setBulkRetries(parseInt(e.target.value) || 3),
-                disabled: isBulkProcessing,
-                className: 'w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white disabled:opacity-50',
-                min: 1, max: 10
-              })
+              className: 'w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white disabled:opacity-50'
+            },
+              React.createElement('option', { value: 'best' }, 'Best available'),
+              React.createElement('option', { value: '1080p' }, '1080p'),
+              React.createElement('option', { value: '720p' }, '720p'),
+              React.createElement('option', { value: '480p' }, '480p'),
+              React.createElement('option', { value: '360p' }, '360p')
             )
           )
         ),
 
-        // Season rows
+        // ── Season rows ──
         React.createElement('div', { className: 'mb-4' },
           React.createElement('div', { className: 'flex items-center justify-between mb-3' },
             React.createElement('label', { className: 'text-purple-200 text-sm font-medium' }, 'Seasons & Episodes'),
@@ -570,37 +712,30 @@ function HLSDownloader() {
               React.createElement('div', { key: i, className: 'flex items-center gap-3 bg-white/5 rounded-lg px-4 py-3' },
                 React.createElement('span', { className: 'text-purple-300 text-sm w-16 shrink-0' }, 'Season'),
                 React.createElement('input', {
-                  type: 'number',
-                  value: s.season,
+                  type: 'number', value: s.season,
                   onChange: e => updateBulkSeason(i, 'season', e.target.value),
                   disabled: isBulkProcessing,
-                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm',
-                  min: 1
+                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm', min: 1
                 }),
-                React.createElement('span', { className: 'text-purple-300 text-sm shrink-0' }, 'Episodes'),
+                React.createElement('span', { className: 'text-purple-300 text-sm shrink-0' }, 'ep'),
                 React.createElement('input', {
-                  type: 'number',
-                  value: s.startEpisode,
+                  type: 'number', value: s.startEpisode,
                   onChange: e => updateBulkSeason(i, 'startEpisode', e.target.value),
                   disabled: isBulkProcessing,
-                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm',
-                  min: 1
+                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm', min: 1
                 }),
-                React.createElement('span', { className: 'text-purple-300 text-sm shrink-0' }, 'to'),
+                React.createElement('span', { className: 'text-purple-300 text-sm shrink-0' }, '–'),
                 React.createElement('input', {
-                  type: 'number',
-                  value: s.endEpisode,
+                  type: 'number', value: s.endEpisode,
                   onChange: e => updateBulkSeason(i, 'endEpisode', e.target.value),
                   disabled: isBulkProcessing,
-                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm',
-                  min: 1
+                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm', min: 1
                 }),
                 React.createElement('span', { className: 'text-purple-400 text-xs ml-auto shrink-0' },
-                  `${s.endEpisode - s.startEpisode + 1} episodes`
+                  `${Math.max(0, (parseInt(s.endEpisode) || 0) - (parseInt(s.startEpisode) || 0) + 1)} ep`
                 ),
                 bulkSeasons.length > 1 && React.createElement('button', {
-                  onClick: () => removeBulkSeason(i),
-                  disabled: isBulkProcessing,
+                  onClick: () => removeBulkSeason(i), disabled: isBulkProcessing,
                   className: 'text-red-400 hover:text-red-300 text-lg leading-none disabled:opacity-50'
                 }, '×')
               )
@@ -608,16 +743,19 @@ function HLSDownloader() {
           )
         ),
 
-        // Summary
+        // ── Summary ──
         React.createElement('div', { className: 'bg-blue-500/10 rounded-lg p-3 border border-blue-500/20 mb-4' },
           React.createElement('p', { className: 'text-blue-200 text-sm' },
             `📁 /mnt/nas/shows/${bulkShowName || '…'}/  ·  `,
-            `${bulkSeasons.reduce((sum, s) => sum + (s.endEpisode - s.startEpisode + 1), 0)} episodes total  ·  `,
-            `Quality: ${bulkQuality === 'best' ? 'best available' : bulkQuality}`
+            `${bulkSeasons.reduce((sum, s) => sum + Math.max(0, (parseInt(s.endEpisode) || 0) - (parseInt(s.startEpisode) || 0) + 1), 0)} episodes total  ·  `,
+            `Quality: ${bulkQuality === 'best' ? 'best available' : bulkQuality}  ·  `,
+            bulkSource === 'rivestream'
+              ? 'valhallastream · 5 retries'
+              : `${bulkRequiredDomain.trim() || 'any domain'} · ${bulkRetries} retries`
           )
         ),
 
-        // Status bar
+        // ── Progress ──
         isBulkProcessing && bulkProgress && React.createElement('div', { className: 'mb-4' },
           React.createElement('div', { className: 'flex justify-between text-sm text-purple-200 mb-1' },
             React.createElement('span', null, bulkStatus),
@@ -632,7 +770,7 @@ function HLSDownloader() {
         ),
         (isBulkProcessing || bulkStatus) && !bulkProgress && React.createElement('p', { className: 'text-purple-200 text-sm mb-4' }, bulkStatus),
 
-        // Start button
+        // ── Start button ──
         React.createElement('button', {
           onClick: startBulkDownload,
           disabled: isBulkProcessing || !wsConnected || !bulkBaseUrl.trim() || !bulkShowName.trim(),

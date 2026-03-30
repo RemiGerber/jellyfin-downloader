@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs').promises;
 const http = require('http');
+const https = require('https');
 const { chromium } = require('playwright');
 
 const app = express();
@@ -19,9 +20,29 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
 const activeDownloads = new Map();
+const downloadProgress = new Map(); // id -> last progress data, for restoring on reconnect
+let bulkJobActive = false;
+let manualJobActive = false;
+let currentBulkState = null;
 const deps = { ytDlp: false, ffmpeg: false };
 
 function broadcast(data) {
+  // Track state so new WS clients can receive current job status
+  if (data.type === 'progress') {
+    if (data.status === 'completed' || data.status === 'failed') {
+      downloadProgress.delete(data.id);
+    } else {
+      downloadProgress.set(data.id, data);
+    }
+  } else if (data.type === 'bulk-status') {
+    currentBulkState = data;
+  } else if (data.type === 'bulk-complete') {
+    bulkJobActive = false;
+    currentBulkState = null;
+  } else if (data.type === 'complete') {
+    manualJobActive = false;
+  }
+
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify(data));
@@ -147,6 +168,50 @@ function pickStream(streams, quality) {
   }
 
   return streams[0];
+}
+
+// Recursively extracts season/episode info from various API response shapes
+// Handles TMDB format, nested structures, and alternate key names
+function extractShowInfoFromData(data, depth = 0) {
+  if (!data || typeof data !== 'object' || depth > 6) return null;
+
+  // Pattern: array of season objects [{season_number, episode_count}]
+  if (Array.isArray(data) && data.length > 0) {
+    const seasonItems = data.filter(d =>
+      d && typeof d === 'object' &&
+      (d.season_number !== undefined || d.seasonNumber !== undefined) &&
+      (d.episode_count !== undefined || d.episodeCount !== undefined || Array.isArray(d.episodes))
+    );
+    if (seasonItems.length > 0) {
+      const seasons = seasonItems
+        .map(s => ({
+          season: s.season_number ?? s.seasonNumber,
+          episodeCount: s.episode_count ?? s.episodeCount ?? (Array.isArray(s.episodes) ? s.episodes.length : 0),
+        }))
+        .filter(s => s.season > 0 && s.episodeCount > 0)
+        .sort((a, b) => a.season - b.season)
+        .map(s => ({ season: s.season, startEpisode: 1, endEpisode: s.episodeCount }));
+      if (seasons.length > 0) return { seasons, showName: null };
+    }
+  }
+
+  if (!Array.isArray(data)) {
+    // Pattern: { seasons: [...], name: "..." } — direct TMDB-style
+    if (Array.isArray(data.seasons) && data.seasons.length > 0) {
+      const info = extractShowInfoFromData(data.seasons, depth + 1);
+      if (info) return { ...info, showName: info.showName || data.name || data.title || data.show_name || null };
+    }
+
+    // Try common nested keys
+    for (const key of ['result', 'data', 'show', 'tv', 'series', 'media', 'content', 'info', 'details']) {
+      if (data[key] && typeof data[key] === 'object') {
+        const info = extractShowInfoFromData(data[key], depth + 1);
+        if (info) return { ...info, showName: info.showName || data.name || data.title || null };
+      }
+    }
+  }
+
+  return null;
 }
 
 async function downloadWithYtDlp(url, outputPath, options, downloadId, filename) {
@@ -579,6 +644,7 @@ app.post('/api/download', async (req, res) => {
 
   res.json({ message: 'Download started', count: urls.length });
 
+  manualJobActive = true;
   (async () => {
     const results = [];
     for (let i = 0; i < urls.length; i++) {
@@ -913,6 +979,140 @@ app.post('/api/detect-stream', async (req, res) => {
   }
 });
 
+// Fetches a URL and returns parsed JSON, with a timeout
+function fetchJson(url, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': BROWSER_USER_AGENT } }, res => {
+      let data = '';
+      res.on('data', d => { data += d; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('Invalid JSON response')); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('Timeout')); });
+  });
+}
+
+// TMDB API key extracted from Rivestream's public network traffic (visible in browser devtools)
+const TMDB_API_KEY = 'd64117f26031a428449f102ced3aba73';
+
+// Fast path: extract show ID from a Rivestream URL and query TMDB directly
+async function getShowInfoFromTmdb(showId) {
+  const data = await fetchJson(
+    `https://api.themoviedb.org/3/tv/${showId}?language=en-US&api_key=${TMDB_API_KEY}`
+  );
+  if (!data.seasons) throw new Error('No seasons in TMDB response');
+
+  const seasons = data.seasons
+    .filter(s => s.season_number > 0 && s.episode_count > 0) // skip specials (season 0)
+    .sort((a, b) => a.season_number - b.season_number)
+    .map(s => ({ season: s.season_number, startEpisode: 1, endEpisode: s.episode_count }));
+
+  return { seasons, showName: data.name || null };
+}
+
+// Slow path: open the page with a browser, intercept JSON API responses, extract season info
+async function getShowInfoViaBrowser(pageUrl) {
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    const context = await browser.newContext({
+      userAgent: BROWSER_USER_AGENT, viewport: { width: 1280, height: 720 }, locale: 'en-US',
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    const capturedJson = [];
+    context.on('response', async response => {
+      try {
+        const ct = response.headers()['content-type'] || '';
+        if (!ct.includes('json')) return;
+        const text = await response.text().catch(() => '');
+        if (!text || text.length > 500_000) return;
+        capturedJson.push(JSON.parse(text));
+      } catch {}
+    });
+
+    const page = await context.newPage();
+    try {
+      await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 22000 });
+    } catch (e) {
+      console.log('show-info browser: load warning:', e.message.slice(0, 80));
+    }
+    await page.waitForTimeout(2000);
+
+    // Sort larger payloads first (more likely to be show metadata)
+    capturedJson.sort((a, b) => JSON.stringify(b).length - JSON.stringify(a).length);
+    for (const data of capturedJson) {
+      const info = extractShowInfoFromData(data);
+      if (info?.seasons?.length > 0) {
+        await browser.close();
+        return info;
+      }
+    }
+
+    // Fallback: check Next.js page data embedded in the HTML
+    const nextData = await page.evaluate(() => {
+      const el = document.querySelector('#__NEXT_DATA__');
+      if (!el) return null;
+      try { return JSON.parse(el.textContent); } catch { return null; }
+    }).catch(() => null);
+
+    await browser.close();
+    browser = null;
+
+    if (nextData) {
+      const info = extractShowInfoFromData(nextData);
+      if (info?.seasons?.length > 0) return info;
+    }
+
+    return null;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+app.post('/api/show-info', async (req, res) => {
+  const { baseUrl } = req.body;
+  if (!baseUrl) return res.status(400).json({ error: 'Missing baseUrl' });
+
+  try {
+    let parsedUrl;
+    try { parsedUrl = new URL(baseUrl); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+
+    // Fast path: Rivestream uses TMDB IDs — query TMDB API directly, no browser needed
+    const showId = parsedUrl.searchParams.get('id');
+    if (showId && parsedUrl.hostname.includes('rivestream')) {
+      console.log('show-info: fast TMDB lookup for id', showId);
+      const info = await getShowInfoFromTmdb(showId);
+      console.log(`show-info: ${info.showName} — ${info.seasons.length} seasons`);
+      return res.json(info);
+    }
+
+    // Slow path: open the page with a browser and intercept API calls
+    console.log('show-info: browser fallback for', baseUrl);
+    const info = await getShowInfoViaBrowser(baseUrl);
+    if (info?.seasons?.length > 0) {
+      console.log('show-info: found via browser:', info.seasons.length, 'seasons');
+      return res.json(info);
+    }
+
+    res.status(404).json({
+      error: 'Could not detect season/episode info from this page.',
+      hint: 'For Rivestream, make sure the URL contains ?type=tv&id=<tmdb_id>. Run explore-rivestream.js for debugging.',
+    });
+  } catch (err) {
+    console.error('show-info error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/bulk-download', async (req, res) => {
   const { baseUrl, seasons, quality, showName, retries = 3, requiredDomain } = req.body;
 
@@ -934,6 +1134,7 @@ app.post('/api/bulk-download', async (req, res) => {
   const totalEpisodes = seasons.reduce((sum, s) => sum + (s.endEpisode - s.startEpisode + 1), 0);
   res.json({ message: 'Bulk download started', totalEpisodes });
 
+  bulkJobActive = true;
   (async () => {
     let completed = 0;
     let failed = 0;
@@ -1048,6 +1249,26 @@ app.get('/api/check-deps', (req, res) => {
 
 wss.on('connection', (ws) => {
   console.log('Client connected');
+
+  // Restore active job state for reconnecting clients
+  if (downloadProgress.size > 0 || bulkJobActive || manualJobActive) {
+    for (const progress of downloadProgress.values()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(progress));
+      }
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'session-state',
+        isProcessing: manualJobActive,
+        isBulkProcessing: bulkJobActive,
+        bulkStatus: currentBulkState?.message || null,
+        bulkProgress: (currentBulkState?.current && currentBulkState?.total)
+          ? { current: currentBulkState.current, total: currentBulkState.total }
+          : null,
+      }));
+    }
+  }
 
   ws.on('close', () => {
     console.log('Client disconnected');
