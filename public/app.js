@@ -12,6 +12,7 @@ function HLSDownloader() {
   });
   const [showSettings, setShowSettings] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'purple');
   const wsRef = useRef(null);
 
   // Manual mode state
@@ -309,10 +310,45 @@ function HLSDownloader() {
     }
   };
 
-  const inputClass = 'w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300';
-  const cardClass = 'bg-white/10 backdrop-blur-lg rounded-2xl p-6 mb-6 border border-white/20';
+  const isDark = theme === 'dark';
+  const toggleTheme = () => {
+    const next = isDark ? 'purple' : 'dark';
+    setTheme(next);
+    localStorage.setItem('theme', next);
+  };
 
-  return React.createElement('div', { className: 'min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-6' },
+  // Theme-aware classes
+  const inputClass = isDark
+    ? 'w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500'
+    : 'w-full bg-white/[0.13] border border-white/25 rounded-lg px-4 py-3 text-white placeholder-purple-300';
+  const cardClass = isDark
+    ? 'bg-gray-900 rounded-2xl p-5 mb-4 border border-gray-800'
+    : 'bg-white/[0.13] backdrop-blur-lg rounded-2xl p-5 mb-4 border border-white/20';
+  const subCard = isDark
+    ? 'bg-gray-800/70 rounded-xl border border-gray-700/60'
+    : 'bg-white/5 rounded-xl border border-white/10';
+  const mutedText = isDark ? 'text-gray-400' : 'text-purple-300';
+  const dimText = isDark ? 'text-gray-500' : 'text-purple-400';
+  const rowBg = isDark ? 'bg-gray-800/50' : 'bg-white/5';
+  const outerBg = isDark
+    ? 'min-h-screen bg-gray-950 p-3'
+    : 'min-h-screen bg-gradient-to-br from-slate-800 via-purple-800 to-slate-800 p-3';
+
+  // Per-season progress derived from the downloads list (filenames encode S01E02)
+  const getSeasonStats = (seasonNum, startEp, endEp) => {
+    const total = Math.max(0, (parseInt(endEp) || 0) - (parseInt(startEp) || 0) + 1);
+    const eps = downloads.filter(d => {
+      const m = d.filename?.match(/S(\d{2})E/i);
+      return m && parseInt(m[1]) === parseInt(seasonNum);
+    });
+    const done = eps.filter(d => d.status === 'completed').length;
+    const failed = eps.filter(d => d.status === 'failed').length;
+    const active = eps.find(d => d.status === 'downloading' || d.status === 'starting');
+    const allDone = total > 0 && eps.length > 0 && done + failed >= total;
+    return { total, done, failed, active, allDone };
+  };
+
+  return React.createElement('div', { className: outerBg },
     React.createElement('div', { className: 'max-w-6xl mx-auto' },
 
       // Header
@@ -320,7 +356,7 @@ function HLSDownloader() {
         React.createElement('div', { className: 'flex items-center justify-between' },
           React.createElement('div', null,
             React.createElement('h1', { className: 'text-3xl font-bold text-white mb-2' }, 'Jellyfin HLS Downloader'),
-            React.createElement('p', { className: 'text-purple-200' },
+            React.createElement('p', { className: mutedText },
               'Download and organize media for Jellyfin ',
               React.createElement('span', {
                 className: `inline-block w-2 h-2 rounded-full ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`,
@@ -328,10 +364,21 @@ function HLSDownloader() {
               })
             )
           ),
-          React.createElement('button', {
-            onClick: () => setShowSettings(!showSettings),
-            className: 'p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors'
-          }, '⚙️')
+          React.createElement('div', { className: 'flex gap-2' },
+            React.createElement('button', {
+              onClick: toggleTheme,
+              title: isDark ? 'Switch to Purple theme' : 'Switch to Dark theme',
+              className: isDark
+                ? 'p-3 bg-gray-800 hover:bg-gray-700 rounded-xl transition-colors text-gray-300'
+                : 'p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors'
+            }, isDark ? '🌙' : '☀️'),
+            React.createElement('button', {
+              onClick: () => setShowSettings(!showSettings),
+              className: isDark
+                ? 'p-3 bg-gray-800 hover:bg-gray-700 rounded-xl transition-colors text-gray-300'
+                : 'p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors'
+            }, '⚙️')
+          )
         )
       ),
 
@@ -340,7 +387,7 @@ function HLSDownloader() {
         React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, 'Advanced Settings'),
         React.createElement('div', { className: 'space-y-4' },
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Max Retries'),
+            React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` }, 'Max Retries'),
             React.createElement('input', {
               type: 'number',
               value: settings.retries,
@@ -350,7 +397,7 @@ function HLSDownloader() {
             })
           ),
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Referer (optional)'),
+            React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` }, 'Referer (optional)'),
             React.createElement('input', {
               type: 'text',
               value: settings.referer,
@@ -360,7 +407,7 @@ function HLSDownloader() {
             })
           ),
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Cookie (optional)'),
+            React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` }, 'Cookie (optional)'),
             React.createElement('input', {
               type: 'text',
               value: settings.cookie,
@@ -377,11 +424,11 @@ function HLSDownloader() {
         React.createElement('div', { className: 'flex gap-3' },
           React.createElement('button', {
             onClick: () => setDownloadMode('manual'),
-            className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'manual' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-200 hover:bg-white/20'}`
+            className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'manual' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200 hover:bg-white/20')}`
           }, '🔗 Manual'),
           React.createElement('button', {
             onClick: () => setDownloadMode('bulk'),
-            className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'bulk' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-200 hover:bg-white/20'}`
+            className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'bulk' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200 hover:bg-white/20')}`
           }, '📦 Bulk Season Download')
         )
       ),
@@ -395,11 +442,11 @@ function HLSDownloader() {
           React.createElement('div', { className: 'flex gap-4 mb-6' },
             React.createElement('button', {
               onClick: () => setMediaType('tv'),
-              className: `flex-1 px-6 py-4 rounded-lg transition-all ${mediaType === 'tv' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-200'}`
+              className: `flex-1 px-6 py-4 rounded-lg transition-all ${mediaType === 'tv' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200')}`
             }, '📺 TV Show'),
             React.createElement('button', {
               onClick: () => setMediaType('movie'),
-              className: `flex-1 px-6 py-4 rounded-lg transition-all ${mediaType === 'movie' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-200'}`
+              className: `flex-1 px-6 py-4 rounded-lg transition-all ${mediaType === 'movie' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200')}`
             }, '🎬 Movie')
           ),
 
@@ -415,12 +462,12 @@ function HLSDownloader() {
                 React.createElement('input', {
                   type: 'number', value: seasonNumber,
                   onChange: (e) => setSeasonNumber(e.target.value),
-                  placeholder: 'Season #', className: 'bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300', min: 1
+                  placeholder: 'Season #', className: inputClass, min: 1
                 }),
                 React.createElement('input', {
                   type: 'number', value: startEpisode,
                   onChange: (e) => setStartEpisode(e.target.value),
-                  placeholder: 'Starting Episode', className: 'bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300', min: 1
+                  placeholder: 'Starting Episode', className: inputClass, min: 1
                 })
               ),
               showName && seasonNumber && React.createElement('div', { className: 'bg-blue-500/10 rounded-lg p-3 border border-blue-500/20' },
@@ -451,7 +498,7 @@ function HLSDownloader() {
         // Auto-Detect
         React.createElement('div', { className: cardClass },
           React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, '🔍 Auto-Detect Stream'),
-          React.createElement('p', { className: 'text-purple-200 text-sm mb-3' },
+          React.createElement('p', { className: `${mutedText} text-sm mb-3` },
             'Paste the webpage URL where the video is playing. The browser will open it, find the stream, and capture all required cookies automatically.'
           ),
           React.createElement('div', { className: 'flex gap-2 mb-2' },
@@ -460,7 +507,7 @@ function HLSDownloader() {
               onChange: e => setPageUrl(e.target.value),
               disabled: isDetecting,
               placeholder: 'https://example.com/watch/episode-1',
-              className: 'flex-1 bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300 disabled:opacity-50'
+              className: `flex-1 disabled:opacity-50 ${inputClass}`
             }),
             React.createElement('button', {
               onClick: detectStream,
@@ -469,18 +516,18 @@ function HLSDownloader() {
             }, isDetecting ? '⏳ Detecting...' : '🔍 Detect')
           ),
           React.createElement('div', { className: 'flex items-center gap-2 mb-3' },
-            React.createElement('label', { className: 'text-purple-300 text-xs whitespace-nowrap' }, 'Required domain:'),
+            React.createElement('label', { className: `${mutedText} text-xs whitespace-nowrap` }, 'Required domain:'),
             React.createElement('input', {
               type: 'text', value: requiredDomain,
               onChange: e => setRequiredDomain(e.target.value),
               disabled: isDetecting,
               placeholder: 'e.g. valhallastream (leave empty to accept any)',
-              className: 'flex-1 bg-white/10 border border-white/20 rounded-lg px-3 py-1.5 text-white text-sm placeholder-purple-400 disabled:opacity-50'
+              className: `flex-1 text-sm disabled:opacity-50 ${inputClass}`
             })
           ),
-          detectStatus && React.createElement('p', { className: 'text-purple-200 text-sm mb-3' }, detectStatus),
+          detectStatus && React.createElement('p', { className: `${mutedText} text-sm mb-3` }, detectStatus),
           detectedStreams.length > 0 && React.createElement('div', { className: 'space-y-2' },
-            detectedStreams.length > 1 && React.createElement('p', { className: 'text-purple-200 text-sm' }, 'Pick a stream to use:'),
+            detectedStreams.length > 1 && React.createElement('p', { className: `${mutedText} text-sm` }, 'Pick a stream to use:'),
             detectedStreams.map((s, i) => {
               let label = s.url;
               try {
@@ -498,15 +545,15 @@ function HLSDownloader() {
               return React.createElement('button', {
                 key: i,
                 onClick: () => { setUrls([s.url]); setDetectStatus(`Selected ${s.type.toUpperCase()} stream`); },
-                className: 'flex items-center gap-2 w-full text-left px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-xs text-purple-200'
+                className: `flex items-center gap-2 w-full text-left px-3 py-2 rounded-lg text-xs ${mutedText} ${isDark ? 'bg-gray-800/50 hover:bg-gray-800' : 'bg-white/5 hover:bg-white/10'}`
               },
                 React.createElement('span', {
                   className: `px-1.5 py-0.5 rounded text-white font-bold shrink-0 ${s.type === 'm3u8' ? 'bg-blue-500' : s.type === 'dash' ? 'bg-green-500' : 'bg-orange-500'}`
                 }, s.type.toUpperCase()),
                 qualityBadge && React.createElement('span', { className: 'px-1.5 py-0.5 rounded bg-white/20 text-white font-bold shrink-0' }, qualityBadge),
-                s.size && React.createElement('span', { className: 'shrink-0 text-purple-300' }, s.size),
-                s.bitrate && React.createElement('span', { className: 'shrink-0 text-purple-400' }, s.bitrate),
-                React.createElement('span', { className: 'font-mono text-purple-300 truncate' }, label)
+                s.size && React.createElement('span', { className: `shrink-0 ${mutedText}` }, s.size),
+                s.bitrate && React.createElement('span', { className: `shrink-0 ${dimText}` }, s.bitrate),
+                React.createElement('span', { className: `font-mono ${mutedText} truncate` }, label)
               );
             })
           )
@@ -530,7 +577,7 @@ function HLSDownloader() {
                   onPaste: i === 0 ? handleBulkPaste : undefined,
                   disabled: isProcessing,
                   placeholder: `URL #${i + 1} (paste multiple in first field)`,
-                  className: 'flex-1 bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300 disabled:opacity-50'
+                  className: `flex-1 disabled:opacity-50 ${inputClass}`
                 }),
                 urls.length > 1 && React.createElement('button', {
                   onClick: () => removeUrlField(i), disabled: isProcessing,
@@ -557,12 +604,12 @@ function HLSDownloader() {
             React.createElement('button', {
               onClick: () => setBulkSource('rivestream'),
               disabled: isBulkProcessing,
-              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'rivestream' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-300 hover:bg-white/20'}`
+              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'rivestream' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-300 hover:bg-white/20')}`
             }, '🎬 Rivestream'),
             React.createElement('button', {
               onClick: () => setBulkSource('custom'),
               disabled: isBulkProcessing,
-              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'custom' ? 'bg-purple-500 text-white' : 'bg-white/10 text-purple-300 hover:bg-white/20'}`
+              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'custom' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-300 hover:bg-white/20')}`
             }, '⚙️ Custom Source')
           ),
 
@@ -574,39 +621,39 @@ function HLSDownloader() {
             React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
               '✓ 5 retries per episode'
             ),
-            React.createElement('span', { className: 'text-purple-400 text-xs' }, 'Optimised for Rivestream streams')
+            React.createElement('span', { className: `${dimText} text-xs` }, 'Optimised for Rivestream streams')
           ),
 
           // Custom source fields
-          bulkSource === 'custom' && React.createElement('div', { className: 'space-y-3 bg-white/5 rounded-xl p-4 border border-white/10' },
-            React.createElement('p', { className: 'text-purple-300 text-xs' },
+          bulkSource === 'custom' && React.createElement('div', { className: `space-y-3 rounded-xl p-4 ${subCard}` },
+            React.createElement('p', { className: `${mutedText} text-xs` },
               'Configure how streams are detected. These settings override the Rivestream defaults.'
             ),
             React.createElement('div', null,
-              React.createElement('label', { className: 'block text-purple-200 mb-1 text-xs font-medium' }, 'Required stream domain'),
+              React.createElement('label', { className: `block mb-1 text-xs font-medium ${mutedText}` }, 'Required stream domain'),
               React.createElement('input', {
                 type: 'text',
                 value: bulkRequiredDomain,
                 onChange: e => setBulkRequiredDomain(e.target.value),
                 disabled: isBulkProcessing,
                 placeholder: 'e.g. valhallastream — leave empty to accept any CDN',
-                className: 'w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white text-sm placeholder-purple-400 disabled:opacity-50'
+                className: `w-full text-sm disabled:opacity-50 ${inputClass}`
               }),
-              React.createElement('p', { className: 'text-purple-500 text-xs mt-1' },
+              React.createElement('p', { className: `${dimText} text-xs mt-1` },
                 'When set, detection retries until a stream URL from this hostname is found (up to 5 attempts per episode).'
               )
             ),
             React.createElement('div', null,
-              React.createElement('label', { className: 'block text-purple-200 mb-1 text-xs font-medium' }, 'Retries per episode'),
+              React.createElement('label', { className: `block mb-1 text-xs font-medium ${mutedText}` }, 'Retries per episode'),
               React.createElement('input', {
                 type: 'number',
                 value: bulkRetries,
                 onChange: e => setBulkRetries(parseInt(e.target.value) || 3),
                 disabled: isBulkProcessing,
-                className: 'w-32 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white text-sm disabled:opacity-50',
+                className: `w-32 text-sm disabled:opacity-50 ${inputClass}`,
                 min: 1, max: 10
               }),
-              React.createElement('p', { className: 'text-purple-500 text-xs mt-1' },
+              React.createElement('p', { className: `${dimText} text-xs mt-1` },
                 'How many times to retry stream detection and download per episode before giving up.'
               )
             )
@@ -616,7 +663,7 @@ function HLSDownloader() {
         // ── Show URL + Detect button ──
         React.createElement('div', { className: 'space-y-4 mb-5' },
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' },
+            React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` },
               bulkSource === 'rivestream' ? 'Rivestream Show URL' : 'Show Page URL'
             ),
             React.createElement('div', { className: 'flex gap-2' },
@@ -629,7 +676,7 @@ function HLSDownloader() {
                 placeholder: bulkSource === 'rivestream'
                   ? 'https://rivestream.org/watch?type=tv&id=79744'
                   : 'https://example.com/show/game-of-thrones',
-                className: 'flex-1 bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300 disabled:opacity-50'
+                className: `flex-1 disabled:opacity-50 ${inputClass}`
               }),
               React.createElement('button', {
                 onClick: detectShow,
@@ -638,7 +685,7 @@ function HLSDownloader() {
               }, isDetectingShow ? '⏳ Detecting...' : '🔍 Detect Show')
             ),
             detectShowStatus && React.createElement('p', {
-              className: `text-sm mt-2 ${showInfo ? 'text-green-300' : 'text-purple-300'}`
+              className: `text-sm mt-2 ${showInfo ? 'text-green-300' : mutedText}`
             }, detectShowStatus)
           ),
 
@@ -660,7 +707,7 @@ function HLSDownloader() {
                   key: s.season,
                   onClick: () => setBulkSeasons([s]),
                   disabled: isBulkProcessing,
-                  className: 'px-3 py-1.5 bg-white/10 hover:bg-white/20 text-purple-200 text-xs rounded-lg disabled:opacity-50'
+                  className: `px-3 py-1.5 text-xs rounded-lg disabled:opacity-50 ${mutedText} ${isDark ? 'bg-gray-800 hover:bg-gray-700' : 'bg-white/10 hover:bg-white/20'}`
                 }, `S${String(s.season).padStart(2, '0')} (${s.endEpisode} ep)`)
               )
             )
@@ -668,7 +715,7 @@ function HLSDownloader() {
 
           // Show Name
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Show Name (for Jellyfin)'),
+            React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` }, 'Show Name (for Jellyfin)'),
             React.createElement('input', {
               type: 'text',
               value: bulkShowName,
@@ -681,12 +728,12 @@ function HLSDownloader() {
 
           // Quality
           React.createElement('div', null,
-            React.createElement('label', { className: 'block text-purple-200 mb-2 text-sm' }, 'Quality'),
+            React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` }, 'Quality'),
             React.createElement('select', {
               value: bulkQuality,
               onChange: e => setBulkQuality(e.target.value),
               disabled: isBulkProcessing,
-              className: 'w-full bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white disabled:opacity-50'
+              className: `w-full disabled:opacity-50 ${inputClass}`
             },
               React.createElement('option', { value: 'best' }, 'Best available'),
               React.createElement('option', { value: '1080p' }, '1080p'),
@@ -700,7 +747,7 @@ function HLSDownloader() {
         // ── Season rows ──
         React.createElement('div', { className: 'mb-4' },
           React.createElement('div', { className: 'flex items-center justify-between mb-3' },
-            React.createElement('label', { className: 'text-purple-200 text-sm font-medium' }, 'Seasons & Episodes'),
+            React.createElement('label', { className: `text-sm font-medium ${mutedText}` }, 'Seasons & Episodes'),
             React.createElement('button', {
               onClick: addBulkSeason,
               disabled: isBulkProcessing,
@@ -708,43 +755,98 @@ function HLSDownloader() {
             }, '+ Add Season')
           ),
           React.createElement('div', { className: 'space-y-2' },
-            bulkSeasons.map((s, i) =>
-              React.createElement('div', { key: i, className: 'flex items-center gap-3 bg-white/5 rounded-lg px-4 py-3' },
-                React.createElement('span', { className: 'text-purple-300 text-sm w-16 shrink-0' }, 'Season'),
-                React.createElement('input', {
-                  type: 'number', value: s.season,
-                  onChange: e => updateBulkSeason(i, 'season', e.target.value),
-                  disabled: isBulkProcessing,
-                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm', min: 1
-                }),
-                React.createElement('span', { className: 'text-purple-300 text-sm shrink-0' }, 'ep'),
-                React.createElement('input', {
-                  type: 'number', value: s.startEpisode,
-                  onChange: e => updateBulkSeason(i, 'startEpisode', e.target.value),
-                  disabled: isBulkProcessing,
-                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm', min: 1
-                }),
-                React.createElement('span', { className: 'text-purple-300 text-sm shrink-0' }, '–'),
-                React.createElement('input', {
-                  type: 'number', value: s.endEpisode,
-                  onChange: e => updateBulkSeason(i, 'endEpisode', e.target.value),
-                  disabled: isBulkProcessing,
-                  className: 'w-16 bg-white/10 border border-white/20 rounded px-2 py-1.5 text-white text-sm', min: 1
-                }),
-                React.createElement('span', { className: 'text-purple-400 text-xs ml-auto shrink-0' },
-                  `${Math.max(0, (parseInt(s.endEpisode) || 0) - (parseInt(s.startEpisode) || 0) + 1)} ep`
-                ),
-                bulkSeasons.length > 1 && React.createElement('button', {
-                  onClick: () => removeBulkSeason(i), disabled: isBulkProcessing,
-                  className: 'text-red-400 hover:text-red-300 text-lg leading-none disabled:opacity-50'
-                }, '×')
-              )
-            )
+            bulkSeasons.map((s, i) => {
+              const stats = getSeasonStats(s.season, s.startEpisode, s.endEpisode);
+              const epCount = Math.max(0, (parseInt(s.endEpisode) || 0) - (parseInt(s.startEpisode) || 0) + 1);
+              const hasActivity = stats.done > 0 || stats.active || stats.failed > 0;
+              const rowColor = stats.allDone
+                ? (isDark ? 'bg-green-900/30 border border-green-800/50' : 'bg-green-500/10 border border-green-500/30')
+                : rowBg;
+
+              return React.createElement('div', { key: i, className: `rounded-lg px-4 py-3 ${rowColor}` },
+
+                // Top row: inputs (hidden while processing) or completion badge
+                stats.allDone
+                  ? React.createElement('div', { className: 'flex items-center gap-3' },
+                      React.createElement('span', { className: 'text-green-400 text-lg' }, '✓'),
+                      React.createElement('span', { className: 'text-green-300 font-medium text-sm' },
+                        `Season ${s.season}`
+                      ),
+                      React.createElement('span', { className: 'text-green-400/70 text-xs ml-1' },
+                        `${stats.done}/${stats.total} downloaded${stats.failed > 0 ? `, ${stats.failed} failed` : ''}`
+                      )
+                    )
+                  : React.createElement('div', { className: 'flex items-center gap-3' },
+                      React.createElement('span', { className: `${mutedText} text-sm w-14 shrink-0` }, 'Season'),
+                      React.createElement('input', {
+                        type: 'number', value: s.season,
+                        onChange: e => updateBulkSeason(i, 'season', e.target.value),
+                        disabled: isBulkProcessing,
+                        className: `w-14 rounded px-2 py-1.5 text-white text-sm ${isDark ? 'bg-gray-700 border border-gray-600' : 'bg-white/10 border border-white/20'}`, min: 1
+                      }),
+                      React.createElement('span', { className: `${mutedText} text-sm shrink-0` }, 'ep'),
+                      React.createElement('input', {
+                        type: 'number', value: s.startEpisode,
+                        onChange: e => updateBulkSeason(i, 'startEpisode', e.target.value),
+                        disabled: isBulkProcessing,
+                        className: `w-14 rounded px-2 py-1.5 text-white text-sm ${isDark ? 'bg-gray-700 border border-gray-600' : 'bg-white/10 border border-white/20'}`, min: 1
+                      }),
+                      React.createElement('span', { className: `${mutedText} text-sm shrink-0` }, '–'),
+                      React.createElement('input', {
+                        type: 'number', value: s.endEpisode,
+                        onChange: e => updateBulkSeason(i, 'endEpisode', e.target.value),
+                        disabled: isBulkProcessing,
+                        className: `w-14 rounded px-2 py-1.5 text-white text-sm ${isDark ? 'bg-gray-700 border border-gray-600' : 'bg-white/10 border border-white/20'}`, min: 1
+                      }),
+                      hasActivity
+                        ? React.createElement('span', { className: `${mutedText} text-xs ml-auto shrink-0` },
+                            `${stats.done}/${epCount}${stats.failed > 0 ? ` · ${stats.failed} ✗` : ''}`
+                          )
+                        : React.createElement('span', { className: `${dimText} text-xs ml-auto shrink-0` },
+                            `${epCount} ep`
+                          ),
+                      !isBulkProcessing && bulkSeasons.length > 1 && React.createElement('button', {
+                        onClick: () => removeBulkSeason(i),
+                        className: 'text-red-400 hover:text-red-300 text-lg leading-none'
+                      }, '×')
+                    ),
+
+                // Progress bar row — shown when this season has an active or partially complete episode
+                hasActivity && !stats.allDone && React.createElement('div', { className: 'mt-2' },
+                  // Overall season progress bar
+                  React.createElement('div', { className: `h-1.5 rounded-full overflow-hidden ${isDark ? 'bg-gray-700' : 'bg-white/10'}` },
+                    React.createElement('div', {
+                      className: 'h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all duration-300',
+                      style: { width: `${epCount > 0 ? ((stats.done / epCount) * 100) : 0}%` }
+                    })
+                  ),
+                  // Active episode detail
+                  stats.active && React.createElement('div', { className: 'mt-1.5' },
+                    React.createElement('div', { className: 'flex items-center justify-between mb-0.5' },
+                      React.createElement('span', { className: `text-xs ${dimText}` },
+                        stats.active.filename?.replace(/\.mp4$/i, '') || 'downloading...'
+                      ),
+                      React.createElement('span', { className: `text-xs ${dimText}` },
+                        `${(stats.active.progress || 0).toFixed(0)}%`
+                        + (stats.active.speed ? `  ${stats.active.speed}` : '')
+                        + (stats.active.eta ? `  ETA ${stats.active.eta}` : '')
+                      )
+                    ),
+                    React.createElement('div', { className: `h-1 rounded-full overflow-hidden ${isDark ? 'bg-gray-700' : 'bg-white/10'}` },
+                      React.createElement('div', {
+                        className: 'h-full bg-indigo-400 transition-all duration-300',
+                        style: { width: `${stats.active.progress || 0}%` }
+                      })
+                    )
+                  )
+                )
+              );
+            })
           )
         ),
 
         // ── Summary ──
-        React.createElement('div', { className: 'bg-blue-500/10 rounded-lg p-3 border border-blue-500/20 mb-4' },
+        React.createElement('div', { className: isDark ? 'bg-blue-900/20 rounded-lg p-3 border border-blue-800/40 mb-4' : 'bg-blue-500/10 rounded-lg p-3 border border-blue-500/20 mb-4' },
           React.createElement('p', { className: 'text-blue-200 text-sm' },
             `📁 /mnt/nas/shows/${bulkShowName || '…'}/  ·  `,
             `${bulkSeasons.reduce((sum, s) => sum + Math.max(0, (parseInt(s.endEpisode) || 0) - (parseInt(s.startEpisode) || 0) + 1), 0)} episodes total  ·  `,
@@ -757,18 +859,18 @@ function HLSDownloader() {
 
         // ── Progress ──
         isBulkProcessing && bulkProgress && React.createElement('div', { className: 'mb-4' },
-          React.createElement('div', { className: 'flex justify-between text-sm text-purple-200 mb-1' },
+          React.createElement('div', { className: `flex justify-between text-sm mb-1 ${mutedText}` },
             React.createElement('span', null, bulkStatus),
             React.createElement('span', null, `${bulkProgress.current}/${bulkProgress.total}`)
           ),
-          React.createElement('div', { className: 'h-2 bg-white/10 rounded-full overflow-hidden' },
+          React.createElement('div', { className: `h-2 rounded-full overflow-hidden ${isDark ? 'bg-gray-700' : 'bg-white/10'}` },
             React.createElement('div', {
               className: 'h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all',
               style: { width: `${(bulkProgress.current / bulkProgress.total) * 100}%` }
             })
           )
         ),
-        (isBulkProcessing || bulkStatus) && !bulkProgress && React.createElement('p', { className: 'text-purple-200 text-sm mb-4' }, bulkStatus),
+        (isBulkProcessing || bulkStatus) && !bulkProgress && React.createElement('p', { className: `text-sm mb-4 ${mutedText}` }, bulkStatus),
 
         // ── Start button ──
         React.createElement('button', {
@@ -779,26 +881,26 @@ function HLSDownloader() {
       ),
 
       // Progress (shared)
-      downloads.length > 0 && React.createElement('div', { className: 'bg-white/10 backdrop-blur-lg rounded-2xl p-6 border border-white/20' },
+      downloads.length > 0 && React.createElement('div', { className: cardClass },
         React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, 'Progress'),
         React.createElement('div', { className: 'space-y-3' },
           downloads.map(d =>
-            React.createElement('div', { key: d.id, className: 'bg-white/5 rounded-lg p-4' },
+            React.createElement('div', { key: d.id, className: `${isDark ? 'bg-gray-800/60 rounded-lg p-4' : 'bg-white/5 rounded-lg p-4'}` },
               React.createElement('div', { className: 'flex justify-between mb-2' },
                 React.createElement('span', { className: 'text-white font-medium' }, d.filename),
-                React.createElement('span', { className: 'text-purple-300 text-sm' },
+                React.createElement('span', { className: `${mutedText} text-sm` },
                   d.status === 'completed' ? '✓' :
                   d.status === 'failed' ? '✗' : '⏱'
                 )
               ),
               d.progress !== undefined && React.createElement('div', null,
-                React.createElement('div', { className: 'h-2 bg-white/10 rounded-full overflow-hidden mb-1' },
+                React.createElement('div', { className: `h-2 rounded-full overflow-hidden mb-1 ${isDark ? 'bg-gray-700' : 'bg-white/10'}` },
                   React.createElement('div', {
                     className: 'h-full bg-gradient-to-r from-purple-500 to-pink-500',
                     style: { width: `${d.progress}%` }
                   })
                 ),
-                React.createElement('div', { className: 'flex justify-between text-xs text-purple-200' },
+                React.createElement('div', { className: `flex justify-between text-xs ${mutedText}` },
                   React.createElement('span', null, `${d.progress.toFixed(1)}%`),
                   d.speed && React.createElement('span', null, d.speed),
                   d.eta && React.createElement('span', null, `ETA: ${d.eta}`)
