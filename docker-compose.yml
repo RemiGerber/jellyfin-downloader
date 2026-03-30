@@ -1,5 +1,6 @@
 services:
   jellyfin-downloader:
+    image: ubbrelf/jellyfin-downloader:latest
     build: .
     ports:
       # Maps port 3003 on your host to port 3003 inside the container.
