@@ -1010,7 +1010,16 @@ async function getShowInfoFromTmdb(showId) {
     .sort((a, b) => a.season_number - b.season_number)
     .map(s => ({ season: s.season_number, startEpisode: 1, endEpisode: s.episode_count }));
 
-  return { seasons, showName: data.name || null };
+  return { mediaType: 'tv', seasons, showName: data.name || null };
+}
+
+async function getMovieInfoFromTmdb(movieId) {
+  const data = await fetchJson(
+    `https://api.themoviedb.org/3/movie/${movieId}?language=en-US&api_key=${TMDB_API_KEY}`
+  );
+  const movieName = data.title || null;
+  const movieYear = data.release_date ? parseInt(data.release_date.substring(0, 4)) : null;
+  return { mediaType: 'movie', movieName, movieYear };
 }
 
 // Slow path: open the page with a browser, intercept JSON API responses, extract season info
@@ -1089,10 +1098,23 @@ app.post('/api/show-info', async (req, res) => {
     // Fast path: Rivestream uses TMDB IDs — query TMDB API directly, no browser needed
     const showId = parsedUrl.searchParams.get('id');
     if (showId && parsedUrl.hostname.includes('rivestream')) {
+      const type = parsedUrl.searchParams.get('type') || 'tv';
+      const seasonParam = parsedUrl.searchParams.get('season');
+      const episodeParam = parsedUrl.searchParams.get('episode');
+      if (type === 'movie') {
+        console.log('show-info: fast TMDB movie lookup for id', showId);
+        const info = await getMovieInfoFromTmdb(showId);
+        console.log(`show-info: movie ${info.movieName} (${info.movieYear})`);
+        return res.json(info);
+      }
       console.log('show-info: fast TMDB lookup for id', showId);
       const info = await getShowInfoFromTmdb(showId);
       console.log(`show-info: ${info.showName} — ${info.seasons.length} seasons`);
-      return res.json(info);
+      return res.json({
+        ...info,
+        ...(seasonParam ? { season: parseInt(seasonParam) } : {}),
+        ...(episodeParam ? { episode: parseInt(episodeParam) } : {}),
+      });
     }
 
     // Slow path: open the page with a browser and intercept API calls

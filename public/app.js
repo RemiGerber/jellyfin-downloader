@@ -33,8 +33,10 @@ function HLSDownloader() {
   // Domain filter (shared)
   const [requiredDomain, setRequiredDomain] = useState('valhallastream');
 
+  // Global source selection
+  const [source, setSource] = useState('rivestream'); // 'rivestream' | 'custom'
+
   // Bulk mode state
-  const [bulkSource, setBulkSource] = useState('rivestream'); // 'rivestream' | 'custom'
   const [bulkBaseUrl, setBulkBaseUrl] = useState('');
   const [bulkShowName, setBulkShowName] = useState('');
   const [bulkQuality, setBulkQuality] = useState('best');
@@ -167,11 +169,39 @@ function HLSDownloader() {
     setIsDetecting(true);
     setDetectStatus('Starting...');
     setDetectedStreams([]);
+
+    // When Rivestream source is selected, auto-fill media info from the URL before detecting the stream
+    if (source === 'rivestream') {
+      try {
+        setDetectStatus('Looking up media info...');
+        const infoRes = await fetch('/api/show-info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ baseUrl: pageUrl.trim() }),
+        });
+        const info = await infoRes.json();
+        if (infoRes.ok) {
+          if (info.mediaType === 'movie') {
+            setMediaType('movie');
+            if (info.movieName) setMovieName(info.movieName);
+            if (info.movieYear) setMovieYear(String(info.movieYear));
+          } else {
+            setMediaType('tv');
+            if (info.showName) setShowName(info.showName);
+            if (info.season) setSeasonNumber(String(info.season));
+            if (info.episode) setStartEpisode(String(info.episode));
+          }
+        }
+      } catch {}
+    }
+
     try {
+      setDetectStatus('Detecting stream...');
+      const domainFilter = source === 'rivestream' ? 'valhallastream' : (requiredDomain.trim() || undefined);
       const response = await fetch('/api/detect-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pageUrl: pageUrl.trim(), requiredDomain: requiredDomain.trim() || undefined })
+        body: JSON.stringify({ pageUrl: pageUrl.trim(), requiredDomain: domainFilter })
       });
       const data = await response.json();
       if (!response.ok) {
@@ -281,8 +311,8 @@ function HLSDownloader() {
           })),
           quality: bulkQuality,
           showName: bulkShowName.trim(),
-          retries: bulkSource === 'rivestream' ? 5 : bulkRetries,
-          requiredDomain: bulkSource === 'rivestream' ? 'valhallastream' : (bulkRequiredDomain.trim() || undefined),
+          retries: source === 'rivestream' ? 5 : bulkRetries,
+          requiredDomain: source === 'rivestream' ? 'valhallastream' : (bulkRequiredDomain.trim() || undefined),
         })
       });
       const data = await response.json();
@@ -501,8 +531,21 @@ function HLSDownloader() {
         )
       ),
 
-      // Mode Toggle
+      // Source + Mode Toggle
       React.createElement('div', { className: cardClass },
+        // Source selection
+        React.createElement('div', { className: 'flex gap-2 mb-3' },
+          React.createElement('button', {
+            onClick: () => setSource('rivestream'),
+            className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all ${source === 'rivestream' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-300 hover:bg-white/20')}`
+          }, '🎬 Rivestream'),
+          React.createElement('button', {
+            onClick: () => { setSource('custom'); if (downloadMode === 'follow') setDownloadMode('manual'); },
+            className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all ${source === 'custom' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-300 hover:bg-white/20')}`
+          }, '⚙️ Custom Source')
+        ),
+        React.createElement('div', { className: `border-t mb-3 ${isDark ? 'border-gray-700' : 'border-white/10'}` }),
+        // Mode tabs
         React.createElement('div', { className: 'flex gap-3' },
           React.createElement('button', {
             onClick: () => setDownloadMode('manual'),
@@ -512,7 +555,7 @@ function HLSDownloader() {
             onClick: () => setDownloadMode('bulk'),
             className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'bulk' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200 hover:bg-white/20')}`
           }, '📦 Bulk'),
-          React.createElement('button', {
+          source === 'rivestream' && React.createElement('button', {
             onClick: () => setDownloadMode('follow'),
             className: `flex-1 py-3 rounded-xl font-semibold transition-all ${downloadMode === 'follow' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-200 hover:bg-white/20')}`
           }, `📺 Follow${followedShows.length > 0 ? ` (${followedShows.length})` : ''}`)
@@ -585,14 +628,18 @@ function HLSDownloader() {
         React.createElement('div', { className: cardClass },
           React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, '🔍 Auto-Detect Stream'),
           React.createElement('p', { className: `${mutedText} text-sm mb-3` },
-            'Paste the webpage URL where the video is playing. The browser will open it, find the stream, and capture all required cookies automatically.'
+            source === 'rivestream'
+              ? 'Paste a Rivestream URL. Show/movie name, season and episode will be filled in automatically, and the stream will be detected.'
+              : 'Paste the webpage URL where the video is playing. The browser will open it, find the stream, and capture all required cookies automatically.'
           ),
           React.createElement('div', { className: 'flex gap-2 mb-2' },
             React.createElement('input', {
               type: 'text', value: pageUrl,
               onChange: e => setPageUrl(e.target.value),
               disabled: isDetecting,
-              placeholder: 'https://example.com/watch/episode-1',
+              placeholder: source === 'rivestream'
+                ? 'https://rivestream.org/watch?type=tv&id=79744&season=1&episode=1'
+                : 'https://example.com/watch/episode-1',
               className: `flex-1 disabled:opacity-50 ${inputClass}`
             }),
             React.createElement('button', {
@@ -601,16 +648,22 @@ function HLSDownloader() {
               className: 'px-6 py-3 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white font-semibold rounded-lg whitespace-nowrap'
             }, isDetecting ? '⏳ Detecting...' : '🔍 Detect')
           ),
-          React.createElement('div', { className: 'flex items-center gap-2 mb-3' },
-            React.createElement('label', { className: `${mutedText} text-xs whitespace-nowrap` }, 'Required domain:'),
-            React.createElement('input', {
-              type: 'text', value: requiredDomain,
-              onChange: e => setRequiredDomain(e.target.value),
-              disabled: isDetecting,
-              placeholder: 'e.g. valhallastream (leave empty to accept any)',
-              className: `flex-1 text-sm disabled:opacity-50 ${inputClass}`
-            })
-          ),
+          source === 'rivestream'
+            ? React.createElement('div', { className: 'flex items-center gap-2 mb-3' },
+                React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
+                  '✓ Domain: valhallastream'
+                )
+              )
+            : React.createElement('div', { className: 'flex items-center gap-2 mb-3' },
+                React.createElement('label', { className: `${mutedText} text-xs whitespace-nowrap` }, 'Required domain:'),
+                React.createElement('input', {
+                  type: 'text', value: requiredDomain,
+                  onChange: e => setRequiredDomain(e.target.value),
+                  disabled: isDetecting,
+                  placeholder: 'e.g. valhallastream (leave empty to accept any)',
+                  className: `flex-1 text-sm disabled:opacity-50 ${inputClass}`
+                })
+              ),
           detectStatus && React.createElement('p', { className: `${mutedText} text-sm mb-3` }, detectStatus),
           detectedStreams.length > 0 && React.createElement('div', { className: 'space-y-2' },
             detectedStreams.length > 1 && React.createElement('p', { className: `${mutedText} text-sm` }, 'Pick a stream to use:'),
@@ -684,73 +737,58 @@ function HLSDownloader() {
       downloadMode === 'bulk' && React.createElement('div', { className: cardClass },
         React.createElement('h2', { className: 'text-xl font-bold text-white mb-5' }, '📦 Bulk Season Download'),
 
-        // ── Source toggle ──
+        // Source info / custom config
         React.createElement('div', { className: 'mb-5' },
-          React.createElement('div', { className: 'flex gap-2 mb-3' },
-            React.createElement('button', {
-              onClick: () => setBulkSource('rivestream'),
-              disabled: isBulkProcessing,
-              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'rivestream' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-300 hover:bg-white/20')}`
-            }, '🎬 Rivestream'),
-            React.createElement('button', {
-              onClick: () => setBulkSource('custom'),
-              disabled: isBulkProcessing,
-              className: `flex-1 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${bulkSource === 'custom' ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white/10 text-purple-300 hover:bg-white/20')}`
-            }, '⚙️ Custom Source')
-          ),
-
-          // Rivestream preset info badge
-          bulkSource === 'rivestream' && React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
-            React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
-              '✓ Domain: valhallastream'
-            ),
-            React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
-              '✓ 5 retries per episode'
-            ),
-            React.createElement('span', { className: `${dimText} text-xs` }, 'Optimised for Rivestream streams')
-          ),
-
-          // Custom source fields
-          bulkSource === 'custom' && React.createElement('div', { className: `space-y-3 rounded-xl p-4 ${subCard}` },
-            React.createElement('p', { className: `${mutedText} text-xs` },
-              'Configure how streams are detected. These settings override the Rivestream defaults.'
-            ),
-            React.createElement('div', null,
-              React.createElement('label', { className: `block mb-1 text-xs font-medium ${mutedText}` }, 'Required stream domain'),
-              React.createElement('input', {
-                type: 'text',
-                value: bulkRequiredDomain,
-                onChange: e => setBulkRequiredDomain(e.target.value),
-                disabled: isBulkProcessing,
-                placeholder: 'e.g. valhallastream — leave empty to accept any CDN',
-                className: `w-full text-sm disabled:opacity-50 ${inputClass}`
-              }),
-              React.createElement('p', { className: `${dimText} text-xs mt-1` },
-                'When set, detection retries until a stream URL from this hostname is found (up to 5 attempts per episode).'
+          source === 'rivestream'
+            ? React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+                React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
+                  '✓ Domain: valhallastream'
+                ),
+                React.createElement('span', { className: 'text-xs bg-green-500/20 text-green-300 border border-green-500/30 rounded px-2 py-1' },
+                  '✓ 5 retries per episode'
+                ),
+                React.createElement('span', { className: `${dimText} text-xs` }, 'Optimised for Rivestream — change source above to customise')
               )
-            ),
-            React.createElement('div', null,
-              React.createElement('label', { className: `block mb-1 text-xs font-medium ${mutedText}` }, 'Retries per episode'),
-              React.createElement('input', {
-                type: 'number',
-                value: bulkRetries,
-                onChange: e => setBulkRetries(parseInt(e.target.value) || 3),
-                disabled: isBulkProcessing,
-                className: `w-32 text-sm disabled:opacity-50 ${inputClass}`,
-                min: 1, max: 10
-              }),
-              React.createElement('p', { className: `${dimText} text-xs mt-1` },
-                'How many times to retry stream detection and download per episode before giving up.'
+            : React.createElement('div', { className: `space-y-3 rounded-xl p-4 ${subCard}` },
+                React.createElement('p', { className: `${mutedText} text-xs` },
+                  'Configure how streams are detected. Change source to Rivestream above for optimised defaults.'
+                ),
+                React.createElement('div', null,
+                  React.createElement('label', { className: `block mb-1 text-xs font-medium ${mutedText}` }, 'Required stream domain'),
+                  React.createElement('input', {
+                    type: 'text',
+                    value: bulkRequiredDomain,
+                    onChange: e => setBulkRequiredDomain(e.target.value),
+                    disabled: isBulkProcessing,
+                    placeholder: 'e.g. valhallastream — leave empty to accept any CDN',
+                    className: `w-full text-sm disabled:opacity-50 ${inputClass}`
+                  }),
+                  React.createElement('p', { className: `${dimText} text-xs mt-1` },
+                    'When set, detection retries until a stream URL from this hostname is found (up to 5 attempts per episode).'
+                  )
+                ),
+                React.createElement('div', null,
+                  React.createElement('label', { className: `block mb-1 text-xs font-medium ${mutedText}` }, 'Retries per episode'),
+                  React.createElement('input', {
+                    type: 'number',
+                    value: bulkRetries,
+                    onChange: e => setBulkRetries(parseInt(e.target.value) || 3),
+                    disabled: isBulkProcessing,
+                    className: `w-32 text-sm disabled:opacity-50 ${inputClass}`,
+                    min: 1, max: 10
+                  }),
+                  React.createElement('p', { className: `${dimText} text-xs mt-1` },
+                    'How many times to retry stream detection and download per episode before giving up.'
+                  )
+                )
               )
-            )
-          )
         ),
 
         // ── Show URL + Detect button ──
         React.createElement('div', { className: 'space-y-4 mb-5' },
           React.createElement('div', null,
             React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` },
-              bulkSource === 'rivestream' ? 'Rivestream Show URL' : 'Show Page URL'
+              source === 'rivestream' ? 'Rivestream Show URL' : 'Show Page URL'
             ),
             React.createElement('div', { className: 'flex gap-2' },
               React.createElement('input', {
@@ -759,7 +797,7 @@ function HLSDownloader() {
                 onChange: e => setBulkBaseUrl(e.target.value),
                 onKeyDown: e => { if (e.key === 'Enter' && bulkBaseUrl.trim() && !isDetectingShow) detectShow(); },
                 disabled: isBulkProcessing || isDetectingShow,
-                placeholder: bulkSource === 'rivestream'
+                placeholder: source === 'rivestream'
                   ? 'https://rivestream.org/watch?type=tv&id=79744'
                   : 'https://example.com/show/game-of-thrones',
                 className: `flex-1 disabled:opacity-50 ${inputClass}`
@@ -937,7 +975,7 @@ function HLSDownloader() {
             `📁 /mnt/nas/shows/${bulkShowName || '…'}/  ·  `,
             `${bulkSeasons.reduce((sum, s) => sum + Math.max(0, (parseInt(s.endEpisode) || 0) - (parseInt(s.startEpisode) || 0) + 1), 0)} episodes total  ·  `,
             `Quality: ${bulkQuality === 'best' ? 'best available' : bulkQuality}  ·  `,
-            bulkSource === 'rivestream'
+            source === 'rivestream'
               ? 'valhallastream · 5 retries'
               : `${bulkRequiredDomain.trim() || 'any domain'} · ${bulkRetries} retries`
           )
