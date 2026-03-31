@@ -198,10 +198,21 @@ function HLSDownloader() {
     try {
       setDetectStatus('Detecting stream...');
       const domainFilter = source === 'rivestream' ? 'valhallastream' : (requiredDomain.trim() || undefined);
+      // Normalize rivestream detail page URLs to watch URLs so the video player auto-starts
+      let streamDetectUrl = pageUrl.trim();
+      if (source === 'rivestream') {
+        try {
+          const u = new URL(streamDetectUrl);
+          if (u.hostname.includes('rivestream') && u.pathname === '/detail') {
+            u.pathname = '/watch';
+            streamDetectUrl = u.toString();
+          }
+        } catch {}
+      }
       const response = await fetch('/api/detect-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pageUrl: pageUrl.trim(), requiredDomain: domainFilter })
+        body: JSON.stringify({ pageUrl: streamDetectUrl, requiredDomain: domainFilter })
       });
       const data = await response.json();
       if (!response.ok) {
@@ -638,7 +649,7 @@ function HLSDownloader() {
               onChange: e => setPageUrl(e.target.value),
               disabled: isDetecting,
               placeholder: source === 'rivestream'
-                ? 'https://rivestream.org/watch?type=tv&id=79744&season=1&episode=1'
+                ? 'https://rivestream.org/detail?type=movie&id=818647  or  /watch?type=tv&id=79744&season=1&episode=1'
                 : 'https://example.com/watch/episode-1',
               className: `flex-1 disabled:opacity-50 ${inputClass}`
             }),
@@ -798,7 +809,7 @@ function HLSDownloader() {
                 onKeyDown: e => { if (e.key === 'Enter' && bulkBaseUrl.trim() && !isDetectingShow) detectShow(); },
                 disabled: isBulkProcessing || isDetectingShow,
                 placeholder: source === 'rivestream'
-                  ? 'https://rivestream.org/watch?type=tv&id=79744'
+                  ? 'https://rivestream.org/detail?type=tv&id=79744  or  /watch?type=tv&id=79744'
                   : 'https://example.com/show/game-of-thrones',
                 className: `flex-1 disabled:opacity-50 ${inputClass}`
               }),
@@ -1022,7 +1033,7 @@ function HLSDownloader() {
               onChange: e => { setFollowUrl(e.target.value); setFollowDetectedInfo(null); setDetectFollowStatus(''); },
               onKeyDown: e => { if (e.key === 'Enter' && followUrl.trim() && !isDetectingFollow) detectFollowShow(); },
               disabled: isAddingFollow,
-              placeholder: 'https://rivestream.org/watch?type=tv&id=79744',
+              placeholder: 'https://rivestream.org/detail?type=tv&id=79744  or  /watch?type=tv&id=79744',
               className: `flex-1 disabled:opacity-50 ${inputClass}`
             }),
             React.createElement('button', {
