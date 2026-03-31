@@ -1,28 +1,20 @@
 services:
   jellyfin-downloader:
-    image: ubbrelf/jellyfin-downloader:latest
+    image: ${DOCKER_IMAGE:-ubbrelf/jellyfin-downloader}:${DOCKER_TAG:-latest}
     build: .
     ports:
-      # Maps port 3003 on your host to port 3003 inside the container.
-      # Change the left side (host port) if 3003 is taken: e.g. "3004:3003"
-      - "3003:3003"
+      - "${HOST_PORT:-3003}:3003"
     volumes:
-      # Maps a host folder into the container at /media.
-      # Change the left side to wherever your media library lives.
+      # Change MEDIA_FOLDER in .env to wherever your media library lives.
       # Examples:
-      #   - /mnt/nas:/media
-      #   - /home/youruser/media:/media
-      #   - D:\Media:/media        (Windows)
-      - /mnt/nas:/media
-      # Persists followed-shows.json across container restarts
-      - jellyfin-downloader-data:/app/data
+      #   MEDIA_FOLDER=/mnt/nas
+      #   MEDIA_FOLDER=/home/youruser/media
+      - ${MEDIA_FOLDER:-/mnt/nas}:/media
+      # Persists app data (followed shows, etc.) across container restarts
+      - ${APP_DATA:-jellyfin-downloader-data}:/app/data  # set APP_DATA to an absolute path to use a host folder instead
     environment:
-      # Tells the app where to write files inside the container.
-      # Must match the right side of the volume mount above.
       - MEDIA_ROOT=/media
-      # Optional: change the port the Node app binds to inside the container.
-      # If you change this, update the right side of the ports mapping too.
-      # - PORT=3003
+      - PORT=3003
     restart: unless-stopped
 
 volumes:
