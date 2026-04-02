@@ -4,6 +4,12 @@ services:
     build: .
     ports:
       - "${HOST_PORT:-3003}:3003"
+    cap_add:
+      - NET_ADMIN      # required: WireGuard interface + routing rules
+    devices:
+      - /dev/net/tun:/dev/net/tun  # required: userspace WireGuard TUN interface
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1  # required: wg-quick fwmark routing
     volumes:
       # Change MEDIA_FOLDER in .env to wherever your media library lives.
       # Examples:
@@ -12,6 +18,10 @@ services:
       - ${MEDIA_FOLDER:-/mnt/nas}:/media
       # Persists app data (followed shows, etc.) across container restarts
       - ${APP_DATA:-jellyfin-downloader-data}:/app/data  # set APP_DATA to an absolute path to use a host folder instead
+      # Drop WireGuard .conf files here to use them as VPN profiles.
+      # Create the folder first: mkdir -p ./vpn
+      # Then place standard WireGuard config files inside it: ./vpn/us-east.conf etc.
+      - ${VPN_CONFIGS:-./vpn}:/app/vpn:ro
     environment:
       - MEDIA_ROOT=/media
       - PORT=3003

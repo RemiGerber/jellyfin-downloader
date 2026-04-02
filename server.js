@@ -6,6 +6,7 @@ const fs = require('fs').promises;
 const http = require('http');
 const https = require('https');
 const { chromium } = require('playwright');
+const vpn = require('./vpn-manager');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -25,6 +26,15 @@ let bulkJobActive = false;
 let manualJobActive = false;
 let currentBulkState = null;
 const deps = { ytDlp: false, ffmpeg: false };
+
+// Spawns a command inside the VPN network namespace when VPN is active,
+// otherwise spawns it normally. All download tools use this so their
+// traffic routes through WireGuard when a VPN profile is connected.
+function spawnWithVpn(cmd, args, options = {}) {
+  const prefix = vpn.getExecPrefix();
+  const [fullCmd, ...fullArgs] = [...prefix, cmd, ...args];
+  return spawn(fullCmd, fullArgs, options);
+}
 
 function broadcast(data) {
   // Track state so new WS clients can receive current job status
@@ -49,6 +59,9 @@ function broadcast(data) {
     }
   });
 }
+
+// Give vpn-manager access to broadcast so it can push status updates to clients
+vpn.setBroadcast(broadcast);
 
 function formatTime(seconds) {
   const h = Math.floor(seconds / 3600);
@@ -240,7 +253,7 @@ async function downloadWithYtDlp(url, outputPath, options, downloadId, filename)
   args.push(url);
 
   return new Promise((resolve, reject) => {
-    const ytdlp = spawn('yt-dlp', args);
+    const ytdlp = spawnWithVpn('yt-dlp', args);
     let lastProgress = 0;
 
     ytdlp.stdout.on('data', (data) => {
@@ -300,12 +313,12 @@ async function downloadWithEnhancedFfmpeg(url, outputPath, options, downloadId, 
   );
 
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn('ffmpeg', args);
+    const ffmpeg = spawnWithVpn('ffmpeg', args);
     let totalDuration = 0;
     let stderr = '';
 
     // Fetch duration in parallel — updates totalDuration when it resolves
-    const ffprobe = spawn('ffprobe', [
+    const ffprobe = spawnWithVpn('ffprobe', [
       '-v', 'error',
       '-show_entries', 'format=duration',
       '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -387,7 +400,7 @@ async function downloadWithReencoding(url, outputPath, options, downloadId, file
   );
 
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn('ffmpeg', args);
+    const ffmpeg = spawnWithVpn('ffmpeg', args);
     let totalDuration = 0;
 
     const progressMonitor = setInterval(async () => {
@@ -451,7 +464,7 @@ async function downloadWithWget(url, outputPath, options, downloadId, filename) 
   args.push(url);
 
   return new Promise((resolve, reject) => {
-    const wget = spawn('wget', args);
+    const wget = spawnWithVpn('wget', args);
     let lastProgress = 0;
 
     wget.stderr.on('data', data => {
@@ -584,6 +597,11 @@ async function downloadUrl(url, options, index, totalCount) {
             method: strategy.name
           });
 
+          // Track bytes for VPN auto-rotation
+          let fileBytes = 0;
+          try { const stat = await fs.stat(outputPath); fileBytes = stat.size; } catch {}
+          vpn.trackDownload({ bytes: fileBytes, failed: false }).catch(() => {});
+
           return { success: true, method: strategy.name };
 
         } catch (err) {
@@ -614,6 +632,8 @@ async function downloadUrl(url, options, index, totalCount) {
       progress: 0,
       error: lastError?.message || 'All strategies failed'
     });
+
+    vpn.trackDownload({ bytes: 0, failed: true }).catch(() => {});
 
     return { success: false, error: lastError?.message };
   } finally {
@@ -683,7 +703,7 @@ async function probeStream(url, cookie, referer) {
     args.push('-timeout', '8000000');  // 8 seconds in microseconds
     args.push(url);
 
-    const ffprobe = spawn('ffprobe', args);
+    const ffprobe = spawnWithVpn('ffprobe', args);
     let out = '';
     ffprobe.stdout.on('data', d => { out += d.toString(); });
     ffprobe.on('close', () => {
@@ -730,11 +750,14 @@ async function detectPageStreams(pageUrl) {
         '--disable-setuid-sandbox',
       ]
     });
-    const context = await browser.newContext({
+    const contextOptions = {
       userAgent: BROWSER_USER_AGENT,
       viewport: { width: 1280, height: 720 },
       locale: 'en-US',
-    });
+    };
+    const playwrightProxy = vpn.getPlaywrightProxy();
+    if (playwrightProxy) contextOptions.proxy = playwrightProxy;
+    const context = await browser.newContext(contextOptions);
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -1030,9 +1053,12 @@ async function getShowInfoViaBrowser(pageUrl) {
       headless: true,
       args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox'],
     });
-    const context = await browser.newContext({
+    const showInfoContextOptions = {
       userAgent: BROWSER_USER_AGENT, viewport: { width: 1280, height: 720 }, locale: 'en-US',
-    });
+    };
+    const showInfoProxy = vpn.getPlaywrightProxy();
+    if (showInfoProxy) showInfoContextOptions.proxy = showInfoProxy;
+    const context = await browser.newContext(showInfoContextOptions);
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -1155,21 +1181,51 @@ async function runBulkEpisodes({ showId, showName, seasons, quality, retries = 3
       });
 
       try {
-        const maxDetectAttempts = requiredDomain ? 5 : 1;
-        let streams, cookieString, userAgent;
+        let streams = [], cookieString, userAgent;
 
-        for (let attempt = 1; attempt <= maxDetectAttempts; attempt++) {
-          if (attempt > 1) {
-            broadcast({
-              type: 'bulk-status',
-              message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — "${requiredDomain}" not found, retrying (${attempt}/${maxDetectAttempts})...`,
-              episode: epLabel, current: episodeNum, total: totalEpisodes,
-            });
-            await new Promise(r => setTimeout(r, 2000));
+        // Detection with optional VPN rotation:
+        //   - try up to retriesPerVpn times on the current VPN
+        //   - if required domain still not found, switch to the next VPN and repeat
+        //   - give up after maxVpnSwitches switches (or immediately if VPN is off / not configured)
+        const dr = vpn.settings.detectionRotate || {};
+        const baseRetries     = requiredDomain ? 5 : 1;
+        const retriesPerVpn   = vpn.activeConfig ? (parseInt(dr.retriesPerVpn)  || baseRetries) : baseRetries;
+        const maxVpnSwitches  = vpn.activeConfig ? (parseInt(dr.maxVpnSwitches) || 0)           : 0;
+        const triedVpns = vpn.activeConfig ? [vpn.activeConfig] : [];
+        let vpnSwitchCount = 0;
+
+        detectionLoop: while (true) {
+          for (let attempt = 1; attempt <= retriesPerVpn; attempt++) {
+            if (attempt > 1) {
+              broadcast({
+                type: 'bulk-status',
+                message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — "${requiredDomain}" not found, retrying (${attempt}/${retriesPerVpn})...`,
+                episode: epLabel, current: episodeNum, total: totalEpisodes,
+              });
+              await new Promise(r => setTimeout(r, 2000));
+            }
+            const result = await detectPageStreams(episodeUrl);
+            streams = result.streams; cookieString = result.cookieString; userAgent = result.userAgent;
+            if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break detectionLoop;
           }
-          const result = await detectPageStreams(episodeUrl);
-          streams = result.streams; cookieString = result.cookieString; userAgent = result.userAgent;
-          if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break;
+
+          // Required domain not found on this VPN — try the next one if configured
+          if (maxVpnSwitches > 0 && vpnSwitchCount < maxVpnSwitches) {
+            const nextVpn = await vpn.getNextForDetection(triedVpns);
+            if (nextVpn) {
+              broadcast({
+                type: 'bulk-status',
+                message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — switching VPN to "${nextVpn}" (${vpnSwitchCount + 1}/${maxVpnSwitches})...`,
+                episode: epLabel, current: episodeNum, total: totalEpisodes,
+              });
+              await vpn.activate(nextVpn).catch(err => console.error(`[VPN] Switch to ${nextVpn} failed: ${err.message}`));
+              triedVpns.push(nextVpn);
+              vpnSwitchCount++;
+              continue detectionLoop;
+            }
+          }
+
+          break; // No more VPNs to try
         }
 
         if (!streams.length) {
@@ -1418,6 +1474,62 @@ app.post('/api/followed-shows/:id/check', (req, res) => {
   checkFollowedShow(show).catch(e => console.error('Manual check error:', e.message));
 });
 
+// ── VPN ─────────────────────────────────────────────────────────────────────
+
+app.get('/api/vpn/configs', async (req, res) => {
+  const configs = await vpn.listConfigs();
+  res.json({ configs });
+});
+
+app.get('/api/vpn/status', (req, res) => {
+  res.json(vpn.getStatus());
+});
+
+app.post('/api/vpn/activate', async (req, res) => {
+  const { config } = req.body;
+  if (!config) return res.status(400).json({ error: 'Missing config name' });
+  try {
+    await vpn.activate(config);
+    vpn.settings.selectedConfig = config;
+    await vpn.saveSettings();
+    res.json(vpn.getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/vpn/deactivate', async (req, res) => {
+  try {
+    await vpn.deactivate();
+    vpn.settings.selectedConfig = null;
+    await vpn.saveSettings();
+    res.json(vpn.getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/vpn/settings', async (req, res) => {
+  const { onFailureCount, onGbDownloaded, detectionRotate } = req.body;
+  vpn.settings.autoRotate = {
+    onFailureCount: parseInt(onFailureCount) || 0,
+    onGbDownloaded: parseFloat(onGbDownloaded) || 0,
+  };
+  if (detectionRotate) {
+    vpn.settings.detectionRotate = {
+      retriesPerVpn:  parseInt(detectionRotate.retriesPerVpn)  || 3,
+      maxVpnSwitches: parseInt(detectionRotate.maxVpnSwitches) || 0,
+      selectionMode:  ['sequential', 'random', 'priority'].includes(detectionRotate.selectionMode)
+                        ? detectionRotate.selectionMode : 'sequential',
+      priorityList: Array.isArray(detectionRotate.priorityList) ? detectionRotate.priorityList : [],
+    };
+  }
+  await vpn.saveSettings();
+  res.json(vpn.getStatus());
+});
+
+// ── Health ───────────────────────────────────────────────────────────────────
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', activeDownloads: activeDownloads.size });
 });
@@ -1458,6 +1570,11 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ type: 'followed-shows', shows: serializeFollowedShows() }));
   }
 
+  // Send current VPN status
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'vpn-status', ...vpn.getStatus() }));
+  }
+
   ws.on('close', () => {
     console.log('Client disconnected');
   });
@@ -1490,5 +1607,22 @@ server.listen(PORT, '0.0.0.0', () => {
       console.log('\n💡 TIP: Install yt-dlp for better compatibility with difficult sources');
       console.log('   pip install yt-dlp');
     }
+
+    // VPN init: clean up stale state, load settings, and auto-connect if previously active
+    await vpn.init();
+    if (vpn.settings.selectedConfig) {
+      console.log(`[VPN] Auto-connecting to saved profile: ${vpn.settings.selectedConfig}`);
+      vpn.activate(vpn.settings.selectedConfig).catch(err => {
+        console.error(`[VPN] Auto-connect failed: ${err.message}`);
+      });
+    }
   })();
 });
+
+// Clean up VPN namespace when the process exits
+async function shutdownVpn() {
+  await vpn.deactivate().catch(() => {});
+  process.exit(0);
+}
+process.on('SIGTERM', shutdownVpn);
+process.on('SIGINT', shutdownVpn);

@@ -62,6 +62,22 @@ function HLSDownloader() {
   const [detectFollowStatus, setDetectFollowStatus] = useState('');
   const [isAddingFollow, setIsAddingFollow] = useState(false);
 
+  // VPN state
+  const [showVpn, setShowVpn] = useState(false);
+  const [vpnStatus, setVpnStatus] = useState({ active: false, config: null, bytesDownloaded: 0, consecutiveFailures: 0 });
+  const [vpnConfigs, setVpnConfigs] = useState([]);
+  const [vpnSelectedConfig, setVpnSelectedConfig] = useState('');
+  const [vpnConnecting, setVpnConnecting] = useState(false);
+  const [vpnError, setVpnError] = useState('');
+  const [vpnAutoRotateFailures, setVpnAutoRotateFailures] = useState(0);
+  const [vpnAutoRotateGb, setVpnAutoRotateGb] = useState(0);
+  const [vpnSettingsSaved, setVpnSettingsSaved] = useState(false);
+  const [vpnRotateNotice, setVpnRotateNotice] = useState('');
+  const [vpnDetectRetriesPerVpn, setVpnDetectRetriesPerVpn] = useState(3);
+  const [vpnDetectMaxSwitches, setVpnDetectMaxSwitches] = useState(0);
+  const [vpnDetectMode, setVpnDetectMode] = useState('sequential');
+  const [vpnDetectPriorityList, setVpnDetectPriorityList] = useState([]);
+
   useEffect(() => {
     let reconnectTimeout;
     let reconnectDelay = 1000;
@@ -113,6 +129,26 @@ function HLSDownloader() {
           }
         } else if (data.type === 'followed-shows') {
           setFollowedShows(data.shows);
+        } else if (data.type === 'vpn-status') {
+          setVpnStatus({ active: data.active, config: data.config, bytesDownloaded: data.bytesDownloaded || 0, consecutiveFailures: data.consecutiveFailures || 0 });
+          if (data.settings) {
+            setVpnAutoRotateFailures(data.settings.autoRotate?.onFailureCount || 0);
+            setVpnAutoRotateGb(data.settings.autoRotate?.onGbDownloaded || 0);
+            if (data.config) setVpnSelectedConfig(data.config);
+            const dr = data.settings.detectionRotate;
+            if (dr) {
+              setVpnDetectRetriesPerVpn(dr.retriesPerVpn ?? 3);
+              setVpnDetectMaxSwitches(dr.maxVpnSwitches ?? 0);
+              setVpnDetectMode(dr.selectionMode || 'sequential');
+              if (dr.priorityList?.length > 0) setVpnDetectPriorityList(dr.priorityList);
+            }
+          }
+        } else if (data.type === 'vpn-stats') {
+          setVpnStatus(prev => ({ ...prev, bytesDownloaded: data.stats.bytesDownloaded, consecutiveFailures: data.stats.consecutiveFailures }));
+        } else if (data.type === 'vpn-rotated') {
+          setVpnRotateNotice(`Auto-rotated: ${data.from} → ${data.to}`);
+          setTimeout(() => setVpnRotateNotice(''), 5000);
+          setVpnSelectedConfig(data.to);
         }
       };
 
@@ -140,6 +176,11 @@ function HLSDownloader() {
       if (wsRef.current) wsRef.current.close();
     };
   }, []);
+
+  // Load VPN configs when panel opens
+  useEffect(() => {
+    if (showVpn) loadVpnConfigs();
+  }, [showVpn]);
 
   // Manual mode handlers
   const addUrlField = () => setUrls([...urls, '']);
@@ -422,6 +463,84 @@ function HLSDownloader() {
     await fetch(`/api/followed-shows/${id}/check`, { method: 'POST' });
   };
 
+  const loadVpnConfigs = async () => {
+    try {
+      const res = await fetch('/api/vpn/configs');
+      const data = await res.json();
+      const configs = data.configs || [];
+      setVpnConfigs(configs);
+      if (configs.length > 0 && !vpnSelectedConfig) setVpnSelectedConfig(configs[0]);
+      // Seed the priority list with all configs if nothing has been saved yet
+      setVpnDetectPriorityList(prev => prev.length > 0 ? prev : configs);
+    } catch {}
+  };
+
+  const vpnConnect = async () => {
+    if (!vpnSelectedConfig) return;
+    setVpnConnecting(true);
+    setVpnError('');
+    try {
+      const res = await fetch('/api/vpn/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: vpnSelectedConfig }),
+      });
+      const data = await res.json();
+      if (!res.ok) setVpnError(data.error || 'Failed to connect');
+    } catch (err) {
+      setVpnError(err.message);
+    } finally {
+      setVpnConnecting(false);
+    }
+  };
+
+  const vpnDisconnect = async () => {
+    setVpnConnecting(true);
+    setVpnError('');
+    try {
+      await fetch('/api/vpn/deactivate', { method: 'POST' });
+    } catch (err) {
+      setVpnError(err.message);
+    } finally {
+      setVpnConnecting(false);
+    }
+  };
+
+  const vpnSaveSettings = async () => {
+    try {
+      await fetch('/api/vpn/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          onFailureCount: vpnAutoRotateFailures,
+          onGbDownloaded: vpnAutoRotateGb,
+          detectionRotate: {
+            retriesPerVpn: vpnDetectRetriesPerVpn,
+            maxVpnSwitches: vpnDetectMaxSwitches,
+            selectionMode: vpnDetectMode,
+            priorityList: vpnDetectPriorityList,
+          },
+        }),
+      });
+      setVpnSettingsSaved(true);
+      setTimeout(() => setVpnSettingsSaved(false), 2000);
+    } catch {}
+  };
+
+  const movePriorityUp = (i) => {
+    if (i === 0) return;
+    const l = [...vpnDetectPriorityList];
+    [l[i - 1], l[i]] = [l[i], l[i - 1]];
+    setVpnDetectPriorityList(l);
+  };
+
+  const movePriorityDown = (i) => {
+    if (i === vpnDetectPriorityList.length - 1) return;
+    const l = [...vpnDetectPriorityList];
+    [l[i + 1], l[i]] = [l[i], l[i + 1]];
+    setVpnDetectPriorityList(l);
+  };
+
   const formatRelativeTime = (isoString) => {
     if (!isoString) return 'never';
     const diff = Date.now() - new Date(isoString).getTime();
@@ -496,7 +615,17 @@ function HLSDownloader() {
                 : 'p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors'
             }, isDark ? '🌙' : '☀️'),
             React.createElement('button', {
-              onClick: () => setShowSettings(!showSettings),
+              onClick: () => { setShowVpn(!showVpn); setShowSettings(false); },
+              title: vpnStatus.active ? `VPN: ${vpnStatus.config}` : 'VPN (disconnected)',
+              className: `p-3 rounded-xl transition-colors relative ${isDark ? 'bg-gray-800 hover:bg-gray-700 text-gray-300' : 'bg-white/10 hover:bg-white/20'}`
+            },
+              '🔒',
+              vpnStatus.active && React.createElement('span', {
+                className: 'absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-green-400'
+              })
+            ),
+            React.createElement('button', {
+              onClick: () => { setShowSettings(!showSettings); setShowVpn(false); },
               className: isDark
                 ? 'p-3 bg-gray-800 hover:bg-gray-700 rounded-xl transition-colors text-gray-300'
                 : 'p-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors'
@@ -540,6 +669,161 @@ function HLSDownloader() {
             })
           )
         )
+      ),
+
+      // VPN Panel
+      showVpn && React.createElement('div', { className: cardClass },
+        React.createElement('h2', { className: 'text-xl font-bold text-white mb-4' }, '🔒 WireGuard VPN'),
+
+        // Rotate notice banner
+        vpnRotateNotice && React.createElement('div', { className: 'mb-3 px-3 py-2 rounded-lg bg-blue-500/20 border border-blue-500/30 text-blue-200 text-sm' }, vpnRotateNotice),
+
+        // Status row
+        React.createElement('div', { className: `rounded-xl p-4 mb-4 ${subCard}` },
+          React.createElement('div', { className: 'flex items-center justify-between gap-3' },
+            React.createElement('div', { className: 'flex items-center gap-2' },
+              React.createElement('span', { className: `w-2.5 h-2.5 rounded-full shrink-0 ${vpnStatus.active ? 'bg-green-400' : 'bg-gray-500'}` }),
+              React.createElement('span', { className: 'text-white font-medium text-sm' },
+                vpnStatus.active ? vpnStatus.config : 'Disconnected'
+              )
+            ),
+            vpnStatus.active
+              ? React.createElement('button', {
+                  onClick: vpnDisconnect,
+                  disabled: vpnConnecting,
+                  className: 'px-3 py-1.5 text-xs rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-300 disabled:opacity-50'
+                }, vpnConnecting ? 'Disconnecting...' : 'Disconnect')
+              : null
+          ),
+          vpnStatus.active && React.createElement('p', { className: `text-xs mt-2 ${dimText}` },
+            `${(vpnStatus.bytesDownloaded / 1e9).toFixed(2)} GB downloaded this session  ·  ${vpnStatus.consecutiveFailures} consecutive failure${vpnStatus.consecutiveFailures !== 1 ? 's' : ''}`
+          )
+        ),
+
+        // Config selector
+        React.createElement('div', { className: 'mb-4' },
+          React.createElement('label', { className: `block mb-2 text-sm ${mutedText}` }, 'VPN Profile'),
+          vpnConfigs.length === 0
+            ? React.createElement('p', { className: `text-sm ${dimText}` },
+                'No .conf files found. Create a ',
+                React.createElement('code', { className: 'bg-black/30 px-1 rounded text-xs' }, './vpn/'),
+                ' folder next to docker-compose.yml and place standard WireGuard .conf files inside it.'
+              )
+            : React.createElement('div', { className: 'flex gap-2' },
+                React.createElement('select', {
+                  value: vpnSelectedConfig,
+                  onChange: e => setVpnSelectedConfig(e.target.value),
+                  disabled: vpnConnecting,
+                  className: `flex-1 disabled:opacity-50 ${inputClass}`
+                },
+                  vpnConfigs.map(c => React.createElement('option', { key: c, value: c }, c))
+                ),
+                React.createElement('button', {
+                  onClick: vpnConnect,
+                  disabled: vpnConnecting || !vpnSelectedConfig || vpnStatus.active,
+                  className: 'px-4 py-2.5 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white text-sm font-semibold rounded-lg whitespace-nowrap'
+                }, vpnConnecting ? 'Connecting...' : 'Connect')
+              )
+        ),
+
+        vpnError && React.createElement('p', { className: 'text-red-400 text-sm mb-3' }, vpnError),
+
+        // Auto-rotation settings
+        React.createElement('div', { className: `rounded-xl p-4 mb-3 ${subCard}` },
+          React.createElement('p', { className: `text-sm font-medium text-white mb-1` }, 'Download auto-rotation'),
+          React.createElement('p', { className: `text-xs mb-3 ${dimText}` }, 'Switch profile after a threshold is hit across all downloads. 0 = disabled.'),
+          React.createElement('div', { className: 'grid grid-cols-2 gap-3' },
+            React.createElement('div', null,
+              React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Rotate after N failures'),
+              React.createElement('input', {
+                type: 'number', min: 0, max: 100,
+                value: vpnAutoRotateFailures,
+                onChange: e => setVpnAutoRotateFailures(parseInt(e.target.value) || 0),
+                className: inputClass
+              })
+            ),
+            React.createElement('div', null,
+              React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Rotate after N GB'),
+              React.createElement('input', {
+                type: 'number', min: 0, step: 0.5,
+                value: vpnAutoRotateGb,
+                onChange: e => setVpnAutoRotateGb(parseFloat(e.target.value) || 0),
+                className: inputClass
+              })
+            )
+          )
+        ),
+
+        // Detection rotation settings
+        React.createElement('div', { className: `rounded-xl p-4 mb-3 ${subCard}` },
+          React.createElement('p', { className: `text-sm font-medium text-white mb-1` }, 'Stream detection rotation'),
+          React.createElement('p', { className: `text-xs mb-3 ${dimText}` },
+            'During bulk downloads, if the required CDN domain isn\'t found after N retries, switch VPN and try again. 0 switches = disabled.'
+          ),
+          React.createElement('div', { className: 'grid grid-cols-2 gap-3 mb-3' },
+            React.createElement('div', null,
+              React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Retries per VPN'),
+              React.createElement('input', {
+                type: 'number', min: 1, max: 20,
+                value: vpnDetectRetriesPerVpn,
+                onChange: e => setVpnDetectRetriesPerVpn(parseInt(e.target.value) || 3),
+                className: inputClass
+              })
+            ),
+            React.createElement('div', null,
+              React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Max VPN switches'),
+              React.createElement('input', {
+                type: 'number', min: 0, max: 50,
+                value: vpnDetectMaxSwitches,
+                onChange: e => setVpnDetectMaxSwitches(parseInt(e.target.value) || 0),
+                className: inputClass
+              })
+            )
+          ),
+
+          // Selection mode
+          React.createElement('label', { className: `block text-xs mb-1 ${mutedText}` }, 'Next VPN selection'),
+          React.createElement('div', { className: 'flex gap-2 mb-3' },
+            ['sequential', 'random', 'priority'].map(mode =>
+              React.createElement('button', {
+                key: mode,
+                onClick: () => setVpnDetectMode(mode),
+                className: `flex-1 py-1.5 text-xs rounded-lg font-medium transition-all ${vpnDetectMode === mode ? 'bg-purple-500 text-white' : (isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-white/10 hover:bg-white/20 text-purple-200')}`
+              }, mode.charAt(0).toUpperCase() + mode.slice(1))
+            )
+          ),
+
+          // Priority list — only shown when mode = priority
+          vpnDetectMode === 'priority' && React.createElement('div', null,
+            React.createElement('p', { className: `text-xs mb-2 ${dimText}` }, 'Profiles tried top to bottom. Use arrows to reorder.'),
+            vpnDetectPriorityList.length === 0
+              ? React.createElement('p', { className: `text-xs ${dimText}` }, 'No configs found — open the VPN panel to load them.')
+              : React.createElement('div', { className: 'space-y-1' },
+                  vpnDetectPriorityList.map((cfg, i) =>
+                    React.createElement('div', {
+                      key: cfg,
+                      className: `flex items-center gap-2 px-3 py-1.5 rounded-lg ${isDark ? 'bg-gray-700/60' : 'bg-white/8'}`
+                    },
+                      React.createElement('span', { className: `text-xs ${mutedText} w-5 shrink-0 text-right` }, `${i + 1}.`),
+                      React.createElement('span', { className: 'text-sm text-white flex-1 truncate' }, cfg),
+                      React.createElement('button', {
+                        onClick: () => movePriorityUp(i), disabled: i === 0,
+                        className: `text-xs px-1.5 py-0.5 rounded disabled:opacity-30 ${isDark ? 'hover:bg-gray-600' : 'hover:bg-white/20'} text-purple-300`
+                      }, '↑'),
+                      React.createElement('button', {
+                        onClick: () => movePriorityDown(i), disabled: i === vpnDetectPriorityList.length - 1,
+                        className: `text-xs px-1.5 py-0.5 rounded disabled:opacity-30 ${isDark ? 'hover:bg-gray-600' : 'hover:bg-white/20'} text-purple-300`
+                      }, '↓')
+                    )
+                  )
+                )
+          )
+        ),
+
+        React.createElement('button', {
+          onClick: vpnSaveSettings,
+          className: `w-full px-4 py-2 text-sm rounded-lg ${vpnSettingsSaved ? 'bg-green-600 text-white' : (isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-200' : 'bg-white/10 hover:bg-white/20 text-white')}`
+        }, vpnSettingsSaved ? '✓ Saved' : 'Save settings')
       ),
 
       // Source + Mode Toggle
