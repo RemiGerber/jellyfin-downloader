@@ -562,13 +562,13 @@ function HLSDownloader() {
   // Theme-aware classes
   const inputClass = isDark
     ? 'w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500'
-    : 'w-full bg-white/[0.13] border border-white/25 rounded-lg px-4 py-3 text-white placeholder-purple-300';
+    : 'w-full bg-slate-900/70 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-purple-300';
   const cardClass = isDark
     ? 'bg-gray-900 rounded-2xl p-5 mb-4 border border-gray-800'
     : 'bg-white/[0.13] backdrop-blur-lg rounded-2xl p-5 mb-4 border border-white/20';
   const subCard = isDark
     ? 'bg-gray-800/70 rounded-xl border border-gray-700/60'
-    : 'bg-white/5 rounded-xl border border-white/10';
+    : 'bg-white/10 rounded-xl border border-white/15';
   const mutedText = isDark ? 'text-gray-400' : 'text-purple-300';
   const dimText = isDark ? 'text-gray-500' : 'text-purple-400';
   const rowBg = isDark ? 'bg-gray-800/50' : 'bg-white/5';
@@ -758,7 +758,7 @@ function HLSDownloader() {
         React.createElement('div', { className: `rounded-xl p-4 mb-3 ${subCard}` },
           React.createElement('p', { className: `text-sm font-medium text-white mb-1` }, 'Stream detection rotation'),
           React.createElement('p', { className: `text-xs mb-3 ${dimText}` },
-            'During bulk downloads, if the required CDN domain isn\'t found after N retries, switch VPN and try again. 0 switches = disabled.'
+            'During bulk downloads, switch VPN after N detection retries if the required domain isn\'t found, or immediately if the download itself fails. 0 switches = disabled.'
           ),
           React.createElement('div', { className: 'grid grid-cols-2 gap-3 mb-3' },
             React.createElement('div', null,

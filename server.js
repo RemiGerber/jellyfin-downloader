@@ -1182,11 +1182,14 @@ async function runBulkEpisodes({ showId, showName, seasons, quality, retries = 3
 
       try {
         let streams = [], cookieString, userAgent;
+        let downloadResult = null;
+        let detectionFailed = false;
 
-        // Detection with optional VPN rotation:
-        //   - try up to retriesPerVpn times on the current VPN
-        //   - if required domain still not found, switch to the next VPN and repeat
-        //   - give up after maxVpnSwitches switches (or immediately if VPN is off / not configured)
+        // Per-episode VPN rotation:
+        //   - try up to retriesPerVpn times on the current VPN for detection
+        //   - if required domain still not found → switch VPN and retry detection
+        //   - if download itself fails → also switch VPN and retry detection + download
+        //   - give up after maxVpnSwitches total switches
         const dr = vpn.settings.detectionRotate || {};
         const baseRetries     = requiredDomain ? 5 : 1;
         const retriesPerVpn   = vpn.activeConfig ? (parseInt(dr.retriesPerVpn)  || baseRetries) : baseRetries;
@@ -1194,7 +1197,11 @@ async function runBulkEpisodes({ showId, showName, seasons, quality, retries = 3
         const triedVpns = vpn.activeConfig ? [vpn.activeConfig] : [];
         let vpnSwitchCount = 0;
 
-        detectionLoop: while (true) {
+        episodeLoop: while (true) {
+          streams = []; cookieString = undefined; userAgent = undefined;
+          detectionFailed = false;
+
+          // Detection phase — retry up to retriesPerVpn times on the current VPN
           for (let attempt = 1; attempt <= retriesPerVpn; attempt++) {
             if (attempt > 1) {
               broadcast({
@@ -1206,51 +1213,75 @@ async function runBulkEpisodes({ showId, showName, seasons, quality, retries = 3
             }
             const result = await detectPageStreams(episodeUrl);
             streams = result.streams; cookieString = result.cookieString; userAgent = result.userAgent;
-            if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break detectionLoop;
+            if (!requiredDomain || streams.some(s => s.url.includes(requiredDomain))) break;
           }
 
-          // Required domain not found on this VPN — try the next one if configured
+          // Detection failure — maybe switch VPN
+          if (!streams.length || (requiredDomain && !streams.some(s => s.url.includes(requiredDomain)))) {
+            detectionFailed = true;
+            if (maxVpnSwitches > 0 && vpnSwitchCount < maxVpnSwitches) {
+              const nextVpn = await vpn.getNextForDetection(triedVpns);
+              if (nextVpn) {
+                broadcast({
+                  type: 'bulk-status',
+                  message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — switching VPN to "${nextVpn}" for detection (${vpnSwitchCount + 1}/${maxVpnSwitches})...`,
+                  episode: epLabel, current: episodeNum, total: totalEpisodes,
+                });
+                await vpn.activate(nextVpn).catch(err => console.error(`[VPN] Switch to ${nextVpn} failed: ${err.message}`));
+                triedVpns.push(nextVpn);
+                vpnSwitchCount++;
+                continue episodeLoop;
+              }
+            }
+            break; // No more VPNs to try
+          }
+
+          // Download phase
+          const stream = pickStream(streams, quality);
+          const qualityLabel = stream.quality || stream.resolution || stream.type;
+          broadcast({
+            type: 'bulk-status',
+            message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — downloading ${qualityLabel}...`,
+            episode: epLabel, current: episodeNum, total: totalEpisodes,
+          });
+
+          downloadResult = await downloadUrl(stream.url, {
+            mediaType: 'tv',
+            settings: { cookie: cookieString, userAgent, referer: episodeUrl, retries },
+            showName, seasonNumber: season, startEpisode: ep,
+          }, 0, 1);
+
+          if (downloadResult.success) break episodeLoop; // done!
+
+          // Download failed — maybe switch VPN and retry
           if (maxVpnSwitches > 0 && vpnSwitchCount < maxVpnSwitches) {
             const nextVpn = await vpn.getNextForDetection(triedVpns);
             if (nextVpn) {
               broadcast({
                 type: 'bulk-status',
-                message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — switching VPN to "${nextVpn}" (${vpnSwitchCount + 1}/${maxVpnSwitches})...`,
+                message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — download failed, switching VPN to "${nextVpn}" (${vpnSwitchCount + 1}/${maxVpnSwitches})...`,
                 episode: epLabel, current: episodeNum, total: totalEpisodes,
               });
               await vpn.activate(nextVpn).catch(err => console.error(`[VPN] Switch to ${nextVpn} failed: ${err.message}`));
               triedVpns.push(nextVpn);
               vpnSwitchCount++;
-              continue detectionLoop;
+              continue episodeLoop;
             }
           }
-
-          break; // No more VPNs to try
+          break; // All VPNs exhausted
         }
 
-        if (!streams.length) {
-          broadcast({ type: 'bulk-status', message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — no streams found`, episode: epLabel, error: true });
-          failed++; continue;
+        if (downloadResult?.success) {
+          completed++;
+        } else {
+          if (detectionFailed && !streams.length) {
+            broadcast({ type: 'bulk-status', message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — no streams found`, episode: epLabel, error: true });
+          } else if (detectionFailed) {
+            broadcast({ type: 'bulk-status', message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — required domain not found after retries`, episode: epLabel, error: true });
+          }
+          // download failure broadcast already emitted by downloadUrl
+          failed++;
         }
-        if (requiredDomain && !streams.some(s => s.url.includes(requiredDomain))) {
-          broadcast({ type: 'bulk-status', message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — required domain not found after retries`, episode: epLabel, error: true });
-          failed++; continue;
-        }
-
-        const stream = pickStream(streams, quality);
-        const qualityLabel = stream.quality || stream.resolution || stream.type;
-        broadcast({
-          type: 'bulk-status',
-          message: `${pfx}[${episodeNum}/${totalEpisodes}] ${epLabel} — downloading ${qualityLabel}...`,
-          episode: epLabel, current: episodeNum, total: totalEpisodes,
-        });
-
-        await downloadUrl(stream.url, {
-          mediaType: 'tv',
-          settings: { cookie: cookieString, userAgent, referer: episodeUrl, retries },
-          showName, seasonNumber: season, startEpisode: ep,
-        }, 0, 1);
-        completed++;
 
       } catch (err) {
         console.error(`Bulk download error for ${epLabel}:`, err.message);
